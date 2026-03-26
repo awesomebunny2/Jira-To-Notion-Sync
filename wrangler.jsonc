@@ -1,0 +1,20 @@
+{
+	"$schema": "./node_modules/wrangler/config-schema.json",
+	"name": "jira-to-notion-sync",
+	"main": "src/index.js",
+	"compatibility_date": "2026-03-23",
+	"observability": {
+		"enabled": true
+	},
+	// After creating the D1 database, uncomment and fill this in:
+	"d1_databases": [
+		{
+			"binding": "DB",
+			"database_name": "jira-to-notion-sync",
+			"database_id": "2ec6f123-714c-405a-b376-8c978b2ca10b"
+		}
+	],
+	"vars": {
+		"NOTION_VERSION": "2022-06-28"
+	}
+}
