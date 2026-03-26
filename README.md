@@ -4,7 +4,7 @@ Clean baseline Worker rebuild.
 
 ## Current scope
 - Jira -> Notion issue create/update sync for issue fields
-- Notion -> Jira status sync
+- Notion -> Jira sync for status and a small writable field set
 - No comment sync in either direction
 - Existing webhooks and Notion database preserved
 
@@ -25,6 +25,7 @@ Clean baseline Worker rebuild.
 - `Reporter`
 - `Labels`
 - `Due date`
+- `Start date` if `JIRA_START_DATE_FIELD_ID` is configured
 - `Original estimate`
 - `Time Spent`
 - `Time Remaining`
@@ -36,7 +37,16 @@ Clean baseline Worker rebuild.
 
 ## Current Direction Rules
 - Jira is the source of truth for all fields above.
-- Notion -> Jira is currently limited to `Status`.
+- Notion -> Jira currently writes:
+  - `Name`
+  - `Description`
+  - `Status`
+  - `Priority`
+  - `Labels`
+  - `Original estimate`
+  - `Start date` if `JIRA_START_DATE_FIELD_ID` is configured
+- `Updated` stays Jira-owned and is refreshed back into Notion after Jira changes.
+- `Time Spent` and `Time Remaining` are still Jira-owned for now.
 - Comments are still out of scope.
 
 ## Commands

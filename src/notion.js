@@ -142,6 +142,7 @@ const PROPERTY_DEFINITIONS = [
   { aliases: ['Reporter'], type: 'rich_text', issueKey: 'reporter' },
   { aliases: ['Labels'], type: 'multi_select_csv', issueKey: 'labels' },
   { aliases: ['Due date', 'Due Date'], type: 'date', issueKey: 'dueDate' },
+  { aliases: ['Start date', 'Start Date'], type: 'date', issueKey: 'startDate' },
   { aliases: ['Original estimate', 'Original Estimate'], type: 'rich_text', issueKey: 'originalEstimate' },
   { aliases: ['Time Spent'], type: 'rich_text', issueKey: 'timeSpent' },
   { aliases: ['Time Remaining'], type: 'rich_text', issueKey: 'timeRemaining' },
@@ -205,6 +206,80 @@ function buildProperties(issue, schema) {
 }
 
 /**
+ * Returns the matching Notion property object for a set of aliases.
+ */
+function getPageProperty(page, aliases) {
+  const properties = page?.properties || {};
+  const propertyName = getSchemaKeyByName(properties, aliases);
+  return propertyName ? properties[propertyName] : undefined;
+}
+
+/**
+ * Reads a plain string from a title or rich-text property.
+ */
+function readTextProperty(property) {
+  if (property === undefined) {
+    return undefined;
+  }
+
+  if (Array.isArray(property?.title)) {
+    return richTextToPlain(property.title);
+  }
+
+  if (Array.isArray(property?.rich_text)) {
+    return richTextToPlain(property.rich_text);
+  }
+
+  return '';
+}
+
+/**
+ * Reads a string from a select-style property.
+ */
+function readSelectProperty(property) {
+  if (property === undefined) {
+    return undefined;
+  }
+
+  if (property.select?.name) {
+    return String(property.select.name).trim();
+  }
+
+  if (property.status?.name) {
+    return String(property.status.name).trim();
+  }
+
+  return '';
+}
+
+/**
+ * Reads a date start value from a Notion date property.
+ */
+function readDateProperty(property) {
+  if (property === undefined) {
+    return undefined;
+  }
+
+  return property.date?.start || null;
+}
+
+/**
+ * Reads a list of labels from a Notion multi-select property.
+ */
+function readMultiSelectProperty(property) {
+  if (property === undefined) {
+    return undefined;
+  }
+
+  if (Array.isArray(property.multi_select)) {
+    return property.multi_select.map((item) => String(item?.name || '').trim()).filter(Boolean);
+  }
+
+  const text = readTextProperty(property);
+  return typeof text === 'string' ? text.split(',').map((item) => item.trim()).filter(Boolean) : [];
+}
+
+/**
  * Looks up an existing Notion page by its Jira Issue Key.
  */
 async function findPageByIssueKey(env, issueKey) {
@@ -241,18 +316,22 @@ export function getNotionIssueKey(page) {
  * Reads the current Status name from either a select or status property.
  */
 export function getNotionStatus(page) {
-  const properties = page?.properties || {};
-  const statusProperty = properties.Status || {};
+  return readSelectProperty(getPageProperty(page, ['Status'])) || '';
+}
 
-  if (statusProperty.select?.name) {
-    return String(statusProperty.select.name).trim();
-  }
-
-  if (statusProperty.status?.name) {
-    return String(statusProperty.status.name).trim();
-  }
-
-  return '';
+/**
+ * Reads the subset of Notion page fields that are allowed to write back into Jira.
+ */
+export function getNotionWritableIssueFields(page) {
+  return {
+    name: readTextProperty(getPageProperty(page, ['Name'])),
+    description: readTextProperty(getPageProperty(page, ['Description'])),
+    status: readSelectProperty(getPageProperty(page, ['Status'])),
+    priority: readSelectProperty(getPageProperty(page, ['Priority'])),
+    labels: readMultiSelectProperty(getPageProperty(page, ['Labels'])),
+    originalEstimate: readTextProperty(getPageProperty(page, ['Original estimate', 'Original Estimate'])),
+    startDate: readDateProperty(getPageProperty(page, ['Start date', 'Start Date'])),
+  };
 }
 
 /**

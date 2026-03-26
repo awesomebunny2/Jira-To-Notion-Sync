@@ -1,6 +1,6 @@
 import { getIssueSyncState, hasDb, saveIssueSyncState } from './db.js';
-import { fetchJiraIssue, toIssueRecord, transitionJiraIssue } from './jira.js';
-import { fetchNotionPage, getNotionIssueKey, getNotionStatus, upsertIssuePage } from './notion.js';
+import { buildJiraIssueFieldUpdate, fetchJiraIssue, toIssueRecord, transitionJiraIssue, updateJiraIssueFields } from './jira.js';
+import { fetchNotionPage, getNotionIssueKey, getNotionStatus, getNotionWritableIssueFields, upsertIssuePage } from './notion.js';
 
 /**
  * Returns a JSON response with standard formatting.
@@ -76,6 +76,13 @@ function getNotionEvent(payload) {
       (data.parent?.type === 'page' ? data.parent.id || '' : '') ||
       (entity.type === 'page' ? entity.id || '' : ''),
   };
+}
+
+/**
+ * Returns true when two status names match case-insensitively.
+ */
+function sameText(left, right) {
+  return String(left || '').trim().toLowerCase() === String(right || '').trim().toLowerCase();
 }
 
 /**
@@ -178,6 +185,7 @@ async function handleNotionWebhook(env, payload) {
     };
   }
 
+  const notionIssue = getNotionWritableIssueFields(page);
   const notionStatus = getNotionStatus(page);
   if (!notionStatus) {
     return {
@@ -189,37 +197,25 @@ async function handleNotionWebhook(env, payload) {
     };
   }
 
-  const state = await getIssueSyncState(env, issueKey);
-  const lastSyncedStatus = String(state?.last_synced_status || '').trim();
   const now = new Date().toISOString();
+  const state = await getIssueSyncState(env, issueKey);
+  const currentJiraIssue = toIssueRecord(env, await fetchJiraIssue(env, issueKey));
 
   console.log('[notion:status-check]', {
     eventId: event.eventId,
     issueKey,
     pageId: event.pageId,
     notionStatus,
-    lastSyncedStatus,
+    jiraStatus: currentJiraIssue.status,
   });
 
-  if (lastSyncedStatus && lastSyncedStatus.toLowerCase() === notionStatus.toLowerCase()) {
-    await saveIssueSyncState(env, {
-      issueKey,
-      notionPageId: event.pageId,
-      lastNotionEventAt: now,
-      lastSyncedStatus,
-    });
-
-    return {
-      ok: true,
-      processed: false,
-      issueKey,
-      pageId: event.pageId,
-      notionStatus,
-      reason: 'Notion status already matches the last synced Jira status.',
-    };
-  }
-
-  const transition = await transitionJiraIssue(env, issueKey, notionStatus);
+  const transition = sameText(notionStatus, currentJiraIssue.status)
+    ? {
+        result: 'already',
+        currentStatus: currentJiraIssue.status,
+        appliedTarget: currentJiraIssue.status,
+      }
+    : await transitionJiraIssue(env, issueKey, notionStatus);
 
   console.log('[notion:jira-transition]', {
     eventId: event.eventId,
@@ -233,25 +229,87 @@ async function handleNotionWebhook(env, payload) {
     availableTargets: transition.availableTargets || null,
   });
 
+  const issueUpdate = buildJiraIssueFieldUpdate(env, notionIssue, currentJiraIssue);
+
+  console.log('[notion:jira-fields]', {
+    eventId: event.eventId,
+    issueKey,
+    pageId: event.pageId,
+    changedFields: issueUpdate.changedFields,
+  });
+
+  if (transition.result === 'already' && issueUpdate.changedFields.length === 0) {
+    await saveIssueSyncState(env, {
+      issueKey,
+      projectKey: state?.project_key || currentJiraIssue.projectKey || null,
+      projectName: state?.project_name || currentJiraIssue.projectName || null,
+      notionPageId: event.pageId,
+      lastNotionEventAt: now,
+      lastSyncedStatus: currentJiraIssue.status,
+    });
+
+    return {
+      ok: true,
+      processed: false,
+      issueKey,
+      pageId: event.pageId,
+      notionStatus,
+      jiraTransitionResult: transition.result,
+      changedFields: issueUpdate.changedFields,
+      reason: 'Notion values already match Jira.',
+    };
+  }
+
+  const statusApplied = transition.result === 'applied';
+  const fieldApplied = issueUpdate.changedFields.length > 0
+    ? await updateJiraIssueFields(env, issueKey, issueUpdate.fields)
+    : false;
+
+  if (!statusApplied && !fieldApplied && transition.result !== 'already') {
+    await saveIssueSyncState(env, {
+      issueKey,
+      projectKey: state?.project_key || currentJiraIssue.projectKey || null,
+      projectName: state?.project_name || currentJiraIssue.projectName || null,
+      notionPageId: event.pageId,
+      lastNotionEventAt: now,
+      lastSyncedStatus: currentJiraIssue.status,
+    });
+
+    return {
+      ok: true,
+      processed: false,
+      issueKey,
+      pageId: event.pageId,
+      notionStatus,
+      jiraTransitionResult: transition.result,
+      changedFields: issueUpdate.changedFields,
+      availableTargets: transition.availableTargets || undefined,
+      reason: issueUpdate.changedFields.length === 0 ? 'Notion values already match Jira.' : undefined,
+    };
+  }
+
+  const refreshedIssue = toIssueRecord(env, await fetchJiraIssue(env, issueKey));
+  const notionPageId = await upsertIssuePage(env, refreshedIssue, state?.notion_page_id || event.pageId);
+
   await saveIssueSyncState(env, {
     issueKey,
-    projectKey: state?.project_key || null,
-    projectName: state?.project_name || null,
-    notionPageId: event.pageId,
+    projectKey: refreshedIssue.projectKey,
+    projectName: refreshedIssue.projectName,
+    notionPageId,
     lastNotionEventAt: now,
-    lastSyncedStatus: transition.result === 'unavailable' ? lastSyncedStatus || null : notionStatus,
+    lastSyncedStatus: refreshedIssue.status,
   });
 
   return {
     ok: true,
-    processed: transition.result === 'applied' || transition.result === 'already',
+    processed: statusApplied || fieldApplied,
     issueKey,
-    pageId: event.pageId,
+    pageId: notionPageId,
     notionStatus,
     jiraTransitionResult: transition.result,
-    jiraCurrentStatus: transition.currentStatus || null,
-    jiraTargetStatus: transition.appliedTarget || transition.mappedStatus || notionStatus,
-    availableTargets: transition.availableTargets || undefined,
+    jiraCurrentStatus: refreshedIssue.status,
+    jiraTargetStatus: transition.appliedTarget || transition.mappedStatus || refreshedIssue.status,
+    changedFields: issueUpdate.changedFields,
   };
 }
 

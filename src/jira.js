@@ -173,6 +173,23 @@ function getTimeTrackingValue(prettyValue, secondsValue) {
 }
 
 /**
+ * Converts plain text into the minimal Jira ADF document used for description updates.
+ */
+function textToAdfDoc(text) {
+  const normalized = String(text || '').replace(/\r\n/g, '\n').trim();
+  const paragraphs = normalized ? normalized.split(/\n{2,}/) : [];
+
+  return {
+    type: 'doc',
+    version: 1,
+    content: (paragraphs.length > 0 ? paragraphs : ['']).map((paragraph) => ({
+      type: 'paragraph',
+      content: paragraph ? [{ type: 'text', text: paragraph }] : [],
+    })),
+  };
+}
+
+/**
  * Normalizes Jira timestamps into ISO strings that Notion date properties accept.
  */
 function normalizeIso(value) {
@@ -245,6 +262,11 @@ export async function fetchJiraIssue(env, issueKey) {
     'parent',
     'issuetype',
   ];
+  const startDateFieldId = String(env.JIRA_START_DATE_FIELD_ID || '').trim();
+  if (startDateFieldId) {
+    fields.push(startDateFieldId);
+  }
+
   return jiraRequest(
     env,
     `/rest/api/3/issue/${encodeURIComponent(issueKey)}?fields=${encodeURIComponent(fields.join(','))}`
@@ -345,6 +367,90 @@ export async function transitionJiraIssue(env, issueKey, notionStatus) {
 }
 
 /**
+ * Updates editable Jira issue fields from a partial fields payload.
+ */
+export async function updateJiraIssueFields(env, issueKey, fields) {
+  if (!issueKey || !fields || Object.keys(fields).length === 0) {
+    return false;
+  }
+
+  await jiraRequest(env, `/rest/api/3/issue/${encodeURIComponent(issueKey)}`, {
+    method: 'PUT',
+    body: JSON.stringify({ fields }),
+  });
+
+  return true;
+}
+
+/**
+ * Builds the Jira issue edit payload for the fields the Worker currently lets
+ * Notion write back into Jira.
+ */
+export function buildJiraIssueFieldUpdate(env, notionIssue, jiraIssue) {
+  const fields = {};
+  const changedFields = [];
+  const startDateFieldId = String(env.JIRA_START_DATE_FIELD_ID || '').trim();
+
+  if (typeof notionIssue.name === 'string' && notionIssue.name.trim() && notionIssue.name.trim() !== jiraIssue.name) {
+    fields.summary = notionIssue.name.trim();
+    changedFields.push('Name');
+  }
+
+  if (
+    typeof notionIssue.description === 'string' &&
+    notionIssue.description.trim() !== String(jiraIssue.description || '').trim()
+  ) {
+    fields.description = textToAdfDoc(notionIssue.description);
+    changedFields.push('Description');
+  }
+
+  if (
+    typeof notionIssue.priority === 'string' &&
+    notionIssue.priority.trim() &&
+    notionIssue.priority.trim().toLowerCase() !== String(jiraIssue.priority || '').trim().toLowerCase()
+  ) {
+    fields.priority = { name: notionIssue.priority.trim() };
+    changedFields.push('Priority');
+  }
+
+  if (Array.isArray(notionIssue.labels)) {
+    const notionLabels = notionIssue.labels.map((label) => label.trim()).filter(Boolean).sort();
+    const jiraLabels = String(jiraIssue.labels || '')
+      .split(',')
+      .map((label) => label.trim())
+      .filter(Boolean)
+      .sort();
+
+    if (JSON.stringify(notionLabels) !== JSON.stringify(jiraLabels)) {
+      fields.labels = notionLabels;
+      changedFields.push('Labels');
+    }
+  }
+
+  if (
+    typeof notionIssue.originalEstimate === 'string' &&
+    notionIssue.originalEstimate.trim() &&
+    notionIssue.originalEstimate.trim().toLowerCase() !== String(jiraIssue.originalEstimate || '').trim().toLowerCase()
+  ) {
+    fields.timetracking = {
+      ...(fields.timetracking || {}),
+      originalEstimate: notionIssue.originalEstimate.trim(),
+    };
+    changedFields.push('Original estimate');
+  }
+
+  if (startDateFieldId && notionIssue.startDate !== undefined && notionIssue.startDate !== jiraIssue.startDate) {
+    fields[startDateFieldId] = notionIssue.startDate || null;
+    changedFields.push('Start date');
+  }
+
+  return {
+    fields,
+    changedFields,
+  };
+}
+
+/**
  * Converts the Jira issue payload into the small plain object that the
  * Notion sync code expects.
  */
@@ -353,6 +459,7 @@ export function toIssueRecord(env, issue) {
   const project = fields.project || {};
   const epic = extractEpic(issue);
   const timetracking = fields.timetracking || {};
+  const startDateFieldId = String(env.JIRA_START_DATE_FIELD_ID || '').trim();
   const originalEstimate = getTimeTrackingValue(timetracking.originalEstimate, fields.timeoriginalestimate);
   const timeSpent = getTimeTrackingValue(timetracking.timeSpent, fields.timespent);
   const timeRemaining = getTimeTrackingValue(timetracking.remainingEstimate, fields.timeestimate);
@@ -368,6 +475,7 @@ export function toIssueRecord(env, issue) {
     reporter: (fields.reporter || {}).displayName || '',
     labels: Array.isArray(fields.labels) ? fields.labels.join(', ') : '',
     dueDate: fields.duedate || null,
+    startDate: startDateFieldId ? fields[startDateFieldId] || null : null,
     originalEstimate,
     timeSpent,
     timeRemaining,
