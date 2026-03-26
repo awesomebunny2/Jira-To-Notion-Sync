@@ -37,6 +37,42 @@ async function notionRequest(env, path, options = {}) {
 }
 
 /**
+ * Converts a Notion rich-text array into a plain string.
+ */
+function richTextToPlain(richText) {
+  if (!Array.isArray(richText)) {
+    return '';
+  }
+
+  return richText
+    .map((item) => {
+      if (typeof item?.plain_text === 'string') {
+        return item.plain_text;
+      }
+      return item?.text?.content || '';
+    })
+    .join('')
+    .trim();
+}
+
+/**
+ * Looks up a Notion property name case-insensitively.
+ */
+function getSchemaKeyByName(schema, wantedNames) {
+  const names = Array.isArray(wantedNames) ? wantedNames : [wantedNames];
+  const lowered = new Map(Object.keys(schema || {}).map((key) => [key.toLowerCase(), key]));
+
+  for (const wantedName of names) {
+    const match = lowered.get(String(wantedName || '').toLowerCase());
+    if (match) {
+      return match;
+    }
+  }
+
+  return null;
+}
+
+/**
  * Creates a Notion title-property payload.
  */
 function title(content) {
@@ -62,6 +98,30 @@ function select(name) {
 }
 
 /**
+ * Creates a Notion date-property payload.
+ */
+function date(value) {
+  return value ? { date: { start: value } } : { date: null };
+}
+
+/**
+ * Creates a Notion multi-select-property payload from a comma-separated list.
+ */
+function multiSelectCsv(value) {
+  if (!value) {
+    return { multi_select: [] };
+  }
+
+  return {
+    multi_select: String(value)
+      .split(',')
+      .map((item) => item.trim())
+      .filter(Boolean)
+      .map((name) => ({ name })),
+  };
+}
+
+/**
  * Creates a Notion URL-property payload.
  */
 function url(value) {
@@ -69,17 +129,79 @@ function url(value) {
 }
 
 /**
+ * Describes the Jira-backed Notion properties supported by the lean sync.
+ */
+const PROPERTY_DEFINITIONS = [
+  { aliases: ['Name'], type: 'title', issueKey: 'name' },
+  { aliases: ['Issue Key'], type: 'rich_text', issueKey: 'issueKey' },
+  { aliases: ['Status'], type: 'select', issueKey: 'status' },
+  { aliases: ['Priority'], type: 'select', issueKey: 'priority' },
+  { aliases: ['Assignee'], type: 'rich_text', issueKey: 'assignee' },
+  { aliases: ['Updated'], type: 'date', issueKey: 'updated' },
+  { aliases: ['Description'], type: 'rich_text', issueKey: 'description' },
+  { aliases: ['Reporter'], type: 'rich_text', issueKey: 'reporter' },
+  { aliases: ['Labels'], type: 'multi_select_csv', issueKey: 'labels' },
+  { aliases: ['Due date', 'Due Date'], type: 'date', issueKey: 'dueDate' },
+  { aliases: ['Original estimate', 'Original Estimate'], type: 'rich_text', issueKey: 'originalEstimate' },
+  { aliases: ['Time Spent'], type: 'rich_text', issueKey: 'timeSpent' },
+  { aliases: ['Time Remaining'], type: 'rich_text', issueKey: 'timeRemaining' },
+  { aliases: ['Project Key'], type: 'rich_text', issueKey: 'projectKey' },
+  { aliases: ['Project Name'], type: 'rich_text', issueKey: 'projectName' },
+  { aliases: ['Epic Key'], type: 'rich_text', issueKey: 'epicKey' },
+  { aliases: ['Epic Name'], type: 'rich_text', issueKey: 'epicName' },
+  { aliases: ['Jira URL'], type: 'url', issueKey: 'jiraUrl' },
+];
+
+/**
+ * Builds one Notion property payload from a type definition.
+ */
+function buildPropertyValue(type, value) {
+  switch (type) {
+    case 'title':
+      return title(value);
+    case 'rich_text':
+      return richText(value);
+    case 'select':
+      return select(value);
+    case 'date':
+      return date(value);
+    case 'multi_select_csv':
+      return multiSelectCsv(value);
+    case 'url':
+      return url(value);
+    default:
+      return null;
+  }
+}
+
+/**
+ * Fetches the Notion database schema so optional properties can be written only
+ * when they exist in the current database.
+ */
+async function fetchDatabaseSchema(env) {
+  const database = await notionRequest(env, `/databases/${env.NOTION_DATABASE_ID}`);
+  return database.properties || {};
+}
+
+/**
  * Maps the current Jira issue record into the Notion properties we want to sync.
  */
-function buildProperties(issue) {
-  return {
-    Name: title(issue.name),
-    'Issue Key': richText(issue.issueKey),
-    Status: select(issue.status),
-    'Project Key': richText(issue.projectKey),
-    'Project Name': richText(issue.projectName),
-    'Jira URL': url(issue.jiraUrl),
-  };
+function buildProperties(issue, schema) {
+  const properties = {};
+
+  for (const definition of PROPERTY_DEFINITIONS) {
+    const propertyName = getSchemaKeyByName(schema, definition.aliases);
+    if (!propertyName) {
+      continue;
+    }
+
+    const propertyValue = buildPropertyValue(definition.type, issue[definition.issueKey]);
+    if (propertyValue) {
+      properties[propertyName] = propertyValue;
+    }
+  }
+
+  return properties;
 }
 
 /**
@@ -101,12 +223,46 @@ async function findPageByIssueKey(env, issueKey) {
 }
 
 /**
+ * Fetches a single Notion page by page id.
+ */
+export async function fetchNotionPage(env, pageId) {
+  return notionRequest(env, `/pages/${pageId}`);
+}
+
+/**
+ * Reads the Issue Key property from a Notion page.
+ */
+export function getNotionIssueKey(page) {
+  const properties = page?.properties || {};
+  return richTextToPlain((properties['Issue Key'] || {}).rich_text);
+}
+
+/**
+ * Reads the current Status name from either a select or status property.
+ */
+export function getNotionStatus(page) {
+  const properties = page?.properties || {};
+  const statusProperty = properties.Status || {};
+
+  if (statusProperty.select?.name) {
+    return String(statusProperty.select.name).trim();
+  }
+
+  if (statusProperty.status?.name) {
+    return String(statusProperty.status.name).trim();
+  }
+
+  return '';
+}
+
+/**
  * Updates the existing Notion page for this Jira issue, or creates it if it
  * does not exist yet.
  */
 export async function upsertIssuePage(env, issue, knownPageId = null) {
+  const schema = await fetchDatabaseSchema(env);
   const pageId = knownPageId || (await findPageByIssueKey(env, issue.issueKey))?.id;
-  const properties = buildProperties(issue);
+  const properties = buildProperties(issue, schema);
 
   if (pageId) {
     await notionRequest(env, `/pages/${pageId}`, {

@@ -17,7 +17,19 @@ export async function getIssueSyncState(env, issueKey) {
   }
 
   return env.DB.prepare(
-    `SELECT issue_key, notion_page_id, last_synced_status FROM issue_sync_state WHERE issue_key = ? LIMIT 1`
+    `
+      SELECT
+        issue_key,
+        project_key,
+        project_name,
+        notion_page_id,
+        last_jira_event_at,
+        last_notion_event_at,
+        last_synced_status
+      FROM issue_sync_state
+      WHERE issue_key = ?
+      LIMIT 1
+    `
   )
     .bind(issueKey)
     .first();
@@ -26,10 +38,13 @@ export async function getIssueSyncState(env, issueKey) {
 /**
  * Creates or updates the saved sync state for one Jira issue.
  *
- * Right now this only stores the small set of fields needed for the
- * Jira -> Notion status sync path.
+ * Stores the small set of issue-level sync fields needed by the lean
+ * Jira <-> Notion status sync flow.
  */
-export async function saveIssueSyncState(env, { issueKey, projectKey, projectName, notionPageId, lastSyncedStatus }) {
+export async function saveIssueSyncState(
+  env,
+  { issueKey, projectKey, projectName, notionPageId, lastJiraEventAt, lastNotionEventAt, lastSyncedStatus }
+) {
   if (!env.DB || !issueKey) {
     return;
   }
@@ -41,14 +56,18 @@ export async function saveIssueSyncState(env, { issueKey, projectKey, projectNam
         project_key,
         project_name,
         notion_page_id,
+        last_jira_event_at,
+        last_notion_event_at,
         last_synced_status,
         updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(issue_key) DO UPDATE SET
-        project_key = excluded.project_key,
-        project_name = excluded.project_name,
-        notion_page_id = excluded.notion_page_id,
-        last_synced_status = excluded.last_synced_status,
+        project_key = COALESCE(excluded.project_key, issue_sync_state.project_key),
+        project_name = COALESCE(excluded.project_name, issue_sync_state.project_name),
+        notion_page_id = COALESCE(excluded.notion_page_id, issue_sync_state.notion_page_id),
+        last_jira_event_at = COALESCE(excluded.last_jira_event_at, issue_sync_state.last_jira_event_at),
+        last_notion_event_at = COALESCE(excluded.last_notion_event_at, issue_sync_state.last_notion_event_at),
+        last_synced_status = COALESCE(excluded.last_synced_status, issue_sync_state.last_synced_status),
         updated_at = excluded.updated_at
     `
   )
@@ -57,6 +76,8 @@ export async function saveIssueSyncState(env, { issueKey, projectKey, projectNam
       projectKey || null,
       projectName || null,
       notionPageId || null,
+      lastJiraEventAt || null,
+      lastNotionEventAt || null,
       lastSyncedStatus || null,
       new Date().toISOString()
     )
