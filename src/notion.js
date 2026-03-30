@@ -91,6 +91,55 @@ function richText(content) {
 }
 
 /**
+ * Creates a rich-text payload that preserves clickable hyperlinks for any full
+ * URLs embedded in the text.
+ */
+function richTextWithLinks(content) {
+  const text = String(content || '').slice(0, 2000);
+  if (!text) {
+    return { rich_text: [] };
+  }
+
+  const richTextItems = [];
+  const urlPattern = /https?:\/\/[^\s]+/g;
+  let lastIndex = 0;
+
+  for (const match of text.matchAll(urlPattern)) {
+    const url = match[0];
+    const start = match.index || 0;
+    const leadingText = text.slice(lastIndex, start);
+    if (leadingText) {
+      richTextItems.push({ text: { content: leadingText } });
+    }
+
+    richTextItems.push({
+      text: {
+        content: url,
+        link: { url },
+      },
+    });
+
+    lastIndex = start + url.length;
+  }
+
+  const trailingText = text.slice(lastIndex);
+  if (trailingText) {
+    richTextItems.push({ text: { content: trailingText } });
+  }
+
+  return { rich_text: richTextItems.length > 0 ? richTextItems : [{ text: { content: text } }] };
+}
+
+/**
+ * Ensures the Pull Requests field always ends with one blank line in Notion so
+ * adding another entry stays visually easy in the UI.
+ */
+function formatPullRequestsForNotion(content) {
+  const text = String(content || '').replace(/\r\n/g, '\n').replace(/\n+$/g, '');
+  return text ? `${text}\n\n` : '';
+}
+
+/**
  * Creates a Notion select-property payload.
  */
 function select(name) {
@@ -134,6 +183,7 @@ function url(value) {
 const PROPERTY_DEFINITIONS = [
   { aliases: ['Name'], type: 'title', issueKey: 'name' },
   { aliases: ['Issue Key'], type: 'rich_text', issueKey: 'issueKey' },
+  { aliases: ['Jira Read Only Props'], type: 'rich_text', issueKey: 'jiraReadOnlyProps' },
   { aliases: ['Status'], type: 'select', issueKey: 'status' },
   { aliases: ['Priority'], type: 'select', issueKey: 'priority' },
   { aliases: ['Assignee'], type: 'rich_text', issueKey: 'assignee' },
@@ -144,6 +194,7 @@ const PROPERTY_DEFINITIONS = [
   { aliases: ['Due date', 'Due Date'], type: 'date', issueKey: 'dueDate' },
   { aliases: ['Start date', 'Start Date'], type: 'date', issueKey: 'startDate' },
   { aliases: ['Original estimate', 'Original Estimate'], type: 'rich_text', issueKey: 'originalEstimate' },
+  { aliases: ['Pull Requests', 'Pull Request Link'], type: 'rich_text_with_links', issueKey: 'pullRequests' },
   { aliases: ['Time Spent'], type: 'rich_text', issueKey: 'timeSpent' },
   { aliases: ['Time Remaining'], type: 'rich_text', issueKey: 'timeRemaining' },
   { aliases: ['Project Key'], type: 'rich_text', issueKey: 'projectKey' },
@@ -162,6 +213,8 @@ function buildPropertyValue(type, value) {
       return title(value);
     case 'rich_text':
       return richText(value);
+    case 'rich_text_with_links':
+      return richTextWithLinks(formatPullRequestsForNotion(value));
     case 'select':
       return select(value);
     case 'date':
@@ -228,6 +281,10 @@ function readTextProperty(property) {
 
   if (Array.isArray(property?.rich_text)) {
     return richTextToPlain(property.rich_text);
+  }
+
+  if (typeof property?.formula?.string === 'string') {
+    return String(property.formula.string).trim();
   }
 
   return '';
@@ -308,8 +365,7 @@ export async function fetchNotionPage(env, pageId) {
  * Reads the Issue Key property from a Notion page.
  */
 export function getNotionIssueKey(page) {
-  const properties = page?.properties || {};
-  return richTextToPlain((properties['Issue Key'] || {}).rich_text);
+  return readTextProperty(getPageProperty(page, ['Issue Key'])) || '';
 }
 
 /**
@@ -330,6 +386,7 @@ export function getNotionWritableIssueFields(page) {
     priority: readSelectProperty(getPageProperty(page, ['Priority'])),
     labels: readMultiSelectProperty(getPageProperty(page, ['Labels'])),
     originalEstimate: readTextProperty(getPageProperty(page, ['Original estimate', 'Original Estimate'])),
+    pullRequests: readTextProperty(getPageProperty(page, ['Pull Requests', 'Pull Request Link'])),
     startDate: readDateProperty(getPageProperty(page, ['Start date', 'Start Date'])),
   };
 }

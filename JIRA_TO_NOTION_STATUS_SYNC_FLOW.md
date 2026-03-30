@@ -21,6 +21,7 @@ This document describes the current lean issue-sync code paths in the rebuilt Wo
 5. If the event is not one of the supported Jira issue-refresh events, the Worker ignores it.
 6. If the event is `jira:issue_updated` or a supported `worklog_*` event, the Worker fetches the live Jira issue from the Jira REST API.
 7. The Jira issue response is converted into a small plain issue record used by the Notion sync code.
+   - If `JIRA_START_DATE_FIELD_ID`, `JIRA_SPRINT_FIELD_ID`, or `JIRA_PULL_REQUEST_LINK_FIELD_ID` are not configured, the Worker auto-discovers Jira fields named `Start date`, `Sprint`, and `Pull Request Link` before reading those values.
 8. The Worker checks D1 for an existing saved mapping for that Jira issue.
 9. The Worker upserts the matching Notion page:
    - update the existing page if a page id is already known
@@ -48,6 +49,7 @@ This document describes the current lean issue-sync code paths in the rebuilt Wo
 ## Notion properties currently written
 - `Name`
 - `Issue Key`
+- `Jira Read Only Props`
 - `Status`
 - `Priority`
 - `Assignee`
@@ -58,6 +60,7 @@ This document describes the current lean issue-sync code paths in the rebuilt Wo
 - `Due date`
 - `Start date`
 - `Original estimate`
+- `Pull Requests`
 - `Time Spent`
 - `Time Remaining`
 - `Project Key`
@@ -65,6 +68,24 @@ This document describes the current lean issue-sync code paths in the rebuilt Wo
 - `Epic Key`
 - `Epic Name`
 - `Jira URL`
+
+## Jira Read Only Props format
+- The hidden `Jira Read Only Props` field is written as newline-separated `key::value` pairs.
+- Current keys:
+  - `updated`
+  - `time_spent`
+  - `time_remaining`
+  - `jira_url`
+  - `issue_key`
+  - `reporter`
+  - `due_date`
+  - `project_key`
+  - `project_name`
+  - `epic_key`
+  - `epic_name`
+  - `sprint`
+  - `requested_by`
+  - `date_requested`
 
 ## Files involved
 - `src/index.js`
@@ -86,6 +107,7 @@ This document describes the current lean issue-sync code paths in the rebuilt Wo
 - The code is intentionally narrow.
 - Jira -> Notion sync covers issue fields only.
 - Notion -> Jira sync is limited to a small set of explicitly writable issue fields.
+- `Pull Requests` and `Start date` can sync in both directions.
 - `Updated` remains Jira-owned.
 - `Time Spent` and `Time Remaining` remain Jira-owned until a separate worklog write path is added.
 - Comment sync stays out of scope.
