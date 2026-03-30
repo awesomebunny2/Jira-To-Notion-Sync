@@ -1,6 +1,31 @@
-import { getIssueSyncState, hasDb, saveIssueSyncState } from './db.js';
-import { buildJiraIssueFieldUpdate, fetchJiraIssue, toIssueRecord, transitionJiraIssue, updateJiraIssueFields } from './jira.js';
-import { fetchNotionPage, getNotionIssueKey, getNotionStatus, getNotionWritableIssueFields, upsertIssuePage } from './notion.js';
+import {
+  acquireJiraCommentSyncLock,
+  consumePendingJiraCommentSyncLock,
+  deleteJiraCommentSectionState,
+  getIssueSyncState,
+  getJiraCommentSectionState,
+  hasDb,
+  releaseJiraCommentSyncLock,
+  saveIssueSyncState,
+  saveJiraCommentSectionState,
+} from './db.js';
+import {
+  buildJiraIssueFieldUpdate,
+  fetchJiraComments,
+  fetchJiraIssue,
+  toCommentRecord,
+  toIssueRecord,
+  transitionJiraIssue,
+  updateJiraIssueFields,
+} from './jira.js';
+import {
+  fetchNotionPage,
+  getNotionIssueKey,
+  getNotionStatus,
+  getNotionWritableIssueFields,
+  replaceJiraCommentsSection,
+  upsertIssuePage,
+} from './notion.js';
 
 /**
  * Returns a JSON response with standard formatting.
@@ -48,13 +73,99 @@ function getJiraEvent(payload) {
   const issue = payload?.issue || {};
   const project = issue.fields?.project || {};
   const worklog = payload?.worklog || {};
+  const comment = payload?.comment || {};
 
   return {
     eventType: payload?.webhookEvent || '',
     issueKey: issue.key || '',
     issueId: String(issue.id || worklog.issueId || '').trim(),
     projectKey: project.key || '',
+    commentId: String(comment.id || '').trim(),
   };
+}
+
+/**
+ * Captures the Jira delivery headers that help explain retries or overlapping
+ * webhook deliveries for the same user action.
+ */
+function getJiraDelivery(request, payload) {
+  return {
+    webhookIdentifier: String(request.headers.get('x-atlassian-webhook-identifier') || '').trim(),
+    retryCount: Number(request.headers.get('x-atlassian-webhook-retry') || 0),
+    issueEventTypeName: String(payload?.issue_event_type_name || '').trim(),
+  };
+}
+
+/**
+ * Returns true when the Jira event should refresh the mirrored Jira comments.
+ */
+function isJiraCommentEvent(eventType) {
+  return new Set(['comment_created', 'comment_updated', 'comment_deleted']).has(String(eventType || '').trim());
+}
+
+/**
+ * Mirrors Jira comments into the managed Notion comments container, serializing
+ * concurrent refreshes per issue when the lock table is available.
+ */
+async function syncJiraCommentsToNotion(env, issueKey, notionPageId, eventType) {
+  const lock = await acquireJiraCommentSyncLock(env, issueKey);
+  if (!lock.acquired) {
+    console.log('[jira:comments-sync-skipped]', {
+      eventType,
+      issueKey,
+      notionPageId,
+      reason: 'lock_busy',
+    });
+    return null;
+  }
+
+  let commentCount = null;
+  try {
+    let shouldRunAgain = false;
+
+    do {
+      const comments = (await fetchJiraComments(env, issueKey)).map(toCommentRecord);
+      const commentSectionState = await getJiraCommentSectionState(env, issueKey);
+      const commentSection = await replaceJiraCommentsSection(
+        env,
+        notionPageId,
+        comments,
+        commentSectionState?.blockIds || []
+      );
+
+      if (commentSection.blockIds.length > 0) {
+        await saveJiraCommentSectionState(env, {
+          issueKey,
+          pageId: notionPageId,
+          blockIds: commentSection.blockIds,
+        });
+      } else {
+        await deleteJiraCommentSectionState(env, issueKey);
+      }
+
+      commentCount = commentSection.commentCount;
+
+      console.log('[jira:comments-sync]', {
+        eventType,
+        issueKey,
+        notionPageId,
+        commentCount,
+      });
+
+      shouldRunAgain = await consumePendingJiraCommentSyncLock(env, issueKey, lock.token);
+      if (shouldRunAgain) {
+        console.log('[jira:comments-sync-rerun]', {
+          eventType,
+          issueKey,
+          notionPageId,
+        });
+      }
+    } while (shouldRunAgain);
+  } finally {
+    await releaseJiraCommentSyncLock(env, issueKey, lock.token);
+  }
+
+  return commentCount;
 }
 
 /**
@@ -89,12 +200,25 @@ function sameText(left, right) {
  * Handles Jira issue-update webhooks and syncs the current Jira issue state
  * into the matching Notion page.
  */
-async function handleJiraWebhook(env, payload) {
+async function handleJiraWebhook(env, payload, delivery = {}) {
   const event = getJiraEvent(payload);
-  const supportedEvents = new Set(['jira:issue_updated', 'worklog_created', 'worklog_updated', 'worklog_deleted']);
+  const supportedEvents = new Set([
+    'jira:issue_updated',
+    'worklog_created',
+    'worklog_updated',
+    'worklog_deleted',
+    'comment_created',
+    'comment_updated',
+    'comment_deleted',
+  ]);
 
   // Keep the log small and focused so tail output is easy to scan.
-  console.log('[jira:webhook]', event);
+  console.log('[jira:webhook]', {
+    ...event,
+    webhookIdentifier: delivery.webhookIdentifier || null,
+    retryCount: delivery.retryCount || 0,
+    issueEventTypeName: delivery.issueEventTypeName || null,
+  });
 
   if (!supportedEvents.has(event.eventType)) {
     return {
@@ -114,6 +238,12 @@ async function handleJiraWebhook(env, payload) {
   const issue = toIssueRecord(env, jiraIssue);
   const state = await getIssueSyncState(env, issue.issueKey);
   const notionPageId = await upsertIssuePage(env, issue, state?.notion_page_id || null);
+  const shouldSyncComments = isJiraCommentEvent(event.eventType) || !state?.notion_page_id;
+  let mirroredCommentCount = null;
+
+  if (shouldSyncComments) {
+    mirroredCommentCount = await syncJiraCommentsToNotion(env, issue.issueKey, notionPageId, event.eventType);
+  }
 
   await saveIssueSyncState(env, {
     issueKey: issue.issueKey,
@@ -132,6 +262,7 @@ async function handleJiraWebhook(env, payload) {
     projectKey: issue.projectKey,
     notionPageId,
     status: issue.status,
+    commentCount: mirroredCommentCount,
   };
 }
 
@@ -155,6 +286,15 @@ async function handleNotionWebhook(env, payload) {
     eventTimestamp: event.eventTimestamp,
     deliveryLagMs,
   });
+
+  if (event.eventType === 'page.content_updated') {
+    return {
+      ok: true,
+      processed: false,
+      reason: `Ignored Notion event ${event.eventType}.`,
+      ...event,
+    };
+  }
 
   if (event.eventType.startsWith('comment.')) {
     return {
@@ -340,7 +480,7 @@ export default {
           return json({ ok: false, error: 'invalid_json' }, { status: 400 });
         }
 
-        return json(await handleJiraWebhook(env, payload));
+        return json(await handleJiraWebhook(env, payload, getJiraDelivery(request, payload)));
       }
 
       if (request.method === 'POST' && url.pathname === '/webhook/notion') {

@@ -4,12 +4,16 @@ Clean baseline Worker rebuild.
 
 ## Current scope
 - Jira -> Notion issue create/update sync for issue fields
+- Jira -> Notion mirrored Jira comments section
 - Notion -> Jira sync for status and a small writable field set
-- No comment sync in either direction
+- No Notion -> Jira comment sync yet
 - Existing webhooks and Notion database preserved
 
 ## Jira Events Currently Applied To Notion
 - `jira:issue_updated`
+- `comment_created`
+- `comment_updated`
+- `comment_deleted`
 - `worklog_created`
 - `worklog_updated`
 - `worklog_deleted`
@@ -71,6 +75,7 @@ Clean baseline Worker rebuild.
 
 ## Current Direction Rules
 - Jira is the source of truth for all fields above.
+- Jira is also the source of truth for the mirrored `Jira Comments` page section.
 - Notion -> Jira currently writes:
   - `Name`
   - `Description`
@@ -82,7 +87,14 @@ Clean baseline Worker rebuild.
   - `Start date`
 - `Updated` stays Jira-owned and is refreshed back into Notion after Jira changes.
 - `Time Spent` and `Time Remaining` are still Jira-owned for now.
-- Comments are still out of scope.
+- Jira comments are mirrored into one managed `Jira Comments` callout block on the page.
+- The Worker deletes and recreates that single container on Jira comment webhooks instead of diffing individual comment blocks.
+- Notion native comments are still out of scope.
+- This mirrored comments section relies on the existing `jira_comment_sections` D1 table from the checked-in migrations.
+- When the `jira_comment_sync_locks` migration is applied, Jira comment refreshes are serialized per issue to avoid duplicate callouts during back-to-back webhook deliveries.
+- Mirrored Jira comments preserve Jira `@mentions` as readable plain text in Notion.
+- Jira webhook logs include Atlassian delivery metadata like `webhookIdentifier` and `retryCount` to help diagnose duplicate deliveries.
+- Notion `page.content_updated` events are intentionally ignored because the mirrored Jira comments live in page content and are Jira-owned.
 
 ## Commands
 

@@ -4,7 +4,7 @@ This guide is for a Jira admin who needs to create or update the Jira webhook us
 
 ## Purpose
 
-This webhook sends Jira changes to the Cloudflare Worker so Jira issues can stay in sync with Notion.
+This webhook sends Jira changes to the Cloudflare Worker so Jira issues and mirrored Jira comments can stay in sync with Notion.
 
 ## Webhook URL
 

@@ -167,6 +167,10 @@ function adfToText(node) {
     return '\n';
   }
 
+  if (node.type === 'mention') {
+    return node.attrs?.text || node.attrs?.displayName || '@mention';
+  }
+
   // Jira can serialize URLs inside rich-text custom fields as smart-link card
   // nodes with the URL stored in attrs.url instead of plain text content.
   if (['inlineCard', 'blockCard', 'embedCard'].includes(node.type)) {
@@ -195,6 +199,51 @@ function normalizeMultilineText(value) {
   return String(value || '')
     .replace(/\r\n/g, '\n')
     .trim();
+}
+
+/**
+ * Fetches every Jira comment for one issue using Jira's paginated comment API.
+ */
+export async function fetchJiraComments(env, issueKey) {
+  if (!issueKey) {
+    return [];
+  }
+
+  const comments = [];
+  let startAt = 0;
+  const maxResults = 100;
+
+  while (true) {
+    const result = await jiraRequest(
+      env,
+      `/rest/api/3/issue/${encodeURIComponent(issueKey)}/comment?startAt=${startAt}&maxResults=${maxResults}`
+    );
+    const batch = Array.isArray(result?.comments) ? result.comments : [];
+    comments.push(...batch);
+    const total = Number(result?.total || comments.length);
+
+    if (batch.length === 0 || startAt + batch.length >= total) {
+      break;
+    }
+
+    startAt += batch.length;
+  }
+
+  return comments;
+}
+
+/**
+ * Converts one Jira comment payload into the small plain object used by the
+ * Notion comments mirror.
+ */
+export function toCommentRecord(comment) {
+  return {
+    id: String(comment?.id || '').trim(),
+    author: String(comment?.author?.displayName || 'Unknown').trim() || 'Unknown',
+    created: comment?.created || '',
+    updated: comment?.updated || '',
+    body: normalizeMultilineText(adfToText(comment?.body)) || '(no text)',
+  };
 }
 
 /**

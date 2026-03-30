@@ -5,9 +5,10 @@ This document describes the current lean issue-sync code paths in the rebuilt Wo
 ## Current scope
 - `POST /webhook/jira` is active
 - `POST /webhook/notion` is active
-- Jira `jira:issue_updated` and `worklog_*` events update the matching Notion page fields
+- Jira `jira:issue_updated`, `comment_*`, and `worklog_*` events update the matching Notion page fields
 - Notion page events can trigger Jira status transitions and direct Jira field updates
-- Comment syncing is not part of this flow
+- Jira comments are mirrored into Notion page content
+- Notion comments are still ignored
 
 ## Jira to Notion flow
 
@@ -19,7 +20,7 @@ This document describes the current lean issue-sync code paths in the rebuilt Wo
    - issue key
    - project key
 5. If the event is not one of the supported Jira issue-refresh events, the Worker ignores it.
-6. If the event is `jira:issue_updated` or a supported `worklog_*` event, the Worker fetches the live Jira issue from the Jira REST API.
+6. If the event is `jira:issue_updated`, `comment_*`, or a supported `worklog_*` event, the Worker fetches the live Jira issue from the Jira REST API.
 7. The Jira issue response is converted into a small plain issue record used by the Notion sync code.
    - If `JIRA_START_DATE_FIELD_ID`, `JIRA_SPRINT_FIELD_ID`, or `JIRA_PULL_REQUEST_LINK_FIELD_ID` are not configured, the Worker auto-discovers Jira fields named `Start date`, `Sprint`, and `Pull Request Link` before reading those values.
 8. The Worker checks D1 for an existing saved mapping for that Jira issue.
@@ -27,8 +28,11 @@ This document describes the current lean issue-sync code paths in the rebuilt Wo
    - update the existing page if a page id is already known
    - otherwise look up a page by `Issue Key`
    - if no page exists, create one
-10. The Worker saves the resulting Notion page id and latest synced status into D1.
-11. The Worker returns a JSON response describing what it processed.
+10. On Jira comment events, or when the page is created for the first time, the Worker fetches all Jira comments for the issue.
+11. The Worker acquires a per-issue comment-sync lock when that D1 migration is available, so overlapping Jira comment events serialize cleanly.
+12. The Worker replaces one managed `Jira Comments` callout block on the Notion page with the freshly fetched comments.
+13. The Worker saves the resulting Notion page id and latest synced status into D1.
+14. The Worker returns a JSON response describing what it processed.
 
 ## Notion to Jira flow
 
@@ -36,7 +40,7 @@ This document describes the current lean issue-sync code paths in the rebuilt Wo
 2. The Worker checks the shared secret.
 3. The Worker parses the JSON payload.
 4. The Worker extracts the event type and page id.
-5. Comment events are ignored.
+5. Comment events and `page.content_updated` events are ignored.
 6. The Worker fetches the live Notion page from the Notion API.
 7. The Worker reads the writable Jira-backed fields from the page.
 8. The Worker fetches the live Jira issue and compares the current Jira values against the current Notion values.
@@ -100,15 +104,18 @@ This document describes the current lean issue-sync code paths in the rebuilt Wo
   - Notion page lookup
   - Notion page create/update
   - Notion page property reads
+  - managed Jira comments section block sync
 - `src/db.js`
   - D1 lookup and save for issue sync state/timestamps
+  - D1 save/load for the managed Jira comments section block ids
 
 ## Design constraints
 - The code is intentionally narrow.
-- Jira -> Notion sync covers issue fields only.
+- Jira -> Notion sync covers issue fields plus a mirrored Jira comments callout block.
 - Notion -> Jira sync is limited to a small set of explicitly writable issue fields.
 - `Pull Requests` and `Start date` can sync in both directions.
 - `Updated` remains Jira-owned.
 - `Time Spent` and `Time Remaining` remain Jira-owned until a separate worklog write path is added.
-- Comment sync stays out of scope.
+- Native Notion comment sync stays out of scope.
+- Notion `page.content_updated` events are ignored because mirrored Jira comments live in page content and should not trigger Jira writes.
 - Additional fields and webhook types should be added only after these two status paths are confirmed stable.

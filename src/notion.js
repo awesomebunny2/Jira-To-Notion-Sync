@@ -362,6 +362,299 @@ export async function fetchNotionPage(env, pageId) {
 }
 
 /**
+ * Lists all direct child blocks for one Notion page or block.
+ */
+async function listBlockChildren(env, blockId) {
+  const children = [];
+  let startCursor = null;
+
+  while (true) {
+    const params = new URLSearchParams({ page_size: '100' });
+    if (startCursor) {
+      params.set('start_cursor', startCursor);
+    }
+
+    const result = await notionRequest(env, `/blocks/${blockId}/children?${params.toString()}`);
+    children.push(...(result.results || []));
+    if (!result.has_more) {
+      break;
+    }
+    startCursor = result.next_cursor || null;
+  }
+
+  return children;
+}
+
+/**
+ * Splits a block list into API-sized chunks for Notion append calls.
+ */
+function chunkBlocks(blocks, size = 100) {
+  const chunks = [];
+  for (let index = 0; index < blocks.length; index += size) {
+    chunks.push(blocks.slice(index, index + size));
+  }
+  return chunks;
+}
+
+/**
+ * Appends top-level child blocks and returns the created block ids.
+ */
+async function appendBlocks(env, blockId, blocks) {
+  if (!Array.isArray(blocks) || blocks.length === 0) {
+    return [];
+  }
+
+  const createdIds = [];
+  for (const chunk of chunkBlocks(blocks)) {
+    const result = await notionRequest(env, `/blocks/${blockId}/children`, {
+      method: 'PATCH',
+      body: JSON.stringify({ children: chunk }),
+    });
+
+    for (const created of result.results || []) {
+      if (created?.id) {
+        createdIds.push(created.id);
+      }
+    }
+  }
+
+  return createdIds;
+}
+
+/**
+ * Returns true when a Notion block is already archived.
+ */
+function isArchivedBlock(block) {
+  return Boolean(block?.archived || block?.in_trash);
+}
+
+/**
+ * Archives one Notion block if it is still active.
+ */
+async function deleteBlock(env, block) {
+  if (!block?.id || isArchivedBlock(block)) {
+    return false;
+  }
+
+  try {
+    await notionRequest(env, `/blocks/${block.id}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ archived: true }),
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error || '');
+    if (message.includes("Can't edit block that is archived")) {
+      return false;
+    }
+    throw error;
+  }
+
+  return true;
+}
+
+/**
+ * Formats one timestamp for the mirrored Jira comments header line.
+ */
+function formatCommentDateTime(env, isoString) {
+  if (!isoString) {
+    return 'Unknown time';
+  }
+
+  const date = new Date(isoString);
+  if (Number.isNaN(date.getTime())) {
+    return String(isoString);
+  }
+
+  return new Intl.DateTimeFormat('en-US', {
+    year: 'numeric',
+    month: 'short',
+    day: 'numeric',
+    hour: 'numeric',
+    minute: '2-digit',
+    timeZone: String(env.READ_ONLY_PROPS_TIMEZONE || 'America/New_York').trim() || 'America/New_York',
+    timeZoneName: 'short',
+  }).format(date);
+}
+
+/**
+ * Creates a Notion rich-text node used in mirrored Jira comment blocks.
+ */
+function makeTextNode(content, annotations = {}) {
+  return {
+    type: 'text',
+    text: { content: String(content || '').slice(0, 2000) },
+    annotations: {
+      bold: false,
+      italic: false,
+      strikethrough: false,
+      underline: false,
+      code: false,
+      color: 'default',
+      ...annotations,
+    },
+  };
+}
+
+/**
+ * Splits a comment body into Notion-sized paragraph chunks.
+ */
+function splitCommentBody(body) {
+  const normalized = String(body || '').replace(/\r\n/g, '\n').trim() || '(no text)';
+  const paragraphs = normalized.split(/\n{2,}/).map((part) => part.trim()).filter(Boolean);
+  const output = [];
+
+  for (const paragraph of paragraphs.length > 0 ? paragraphs : [normalized]) {
+    for (let index = 0; index < paragraph.length; index += 1800) {
+      output.push(paragraph.slice(index, index + 1800));
+    }
+  }
+
+  return output.length > 0 ? output : ['(no text)'];
+}
+
+/**
+ * Builds the Notion block payload for one mirrored Jira comment.
+ */
+function formatCommentBlocks(env, comment) {
+  const blocks = [
+    {
+      type: 'paragraph',
+      paragraph: {
+        rich_text: [
+          makeTextNode(comment.author || 'Unknown', { bold: true }),
+          makeTextNode(`  ${formatCommentDateTime(env, comment.created)}`, { italic: true, color: 'gray' }),
+        ],
+      },
+    },
+  ];
+
+  for (const chunk of splitCommentBody(comment.body)) {
+    blocks.push({
+      type: 'paragraph',
+      paragraph: {
+        rich_text: [makeTextNode(chunk)],
+      },
+    });
+  }
+
+  blocks.push({ type: 'divider', divider: {} });
+  return blocks;
+}
+
+/**
+ * Finds a pre-existing Jira Comments heading in case tracked block ids were not
+ * saved yet for an older page.
+ */
+function findCommentsSectionStart(children) {
+  for (let index = 0; index < children.length; index += 1) {
+    const block = children[index];
+    if (isArchivedBlock(block) || block?.type !== 'heading_2') {
+      continue;
+    }
+
+    const title = richTextToPlain(block?.heading_2?.rich_text || []).trim().toLowerCase();
+    if (title !== 'jira comments') {
+      continue;
+    }
+
+    if (index > 0 && !isArchivedBlock(children[index - 1]) && children[index - 1]?.type === 'divider') {
+      return index - 1;
+    }
+
+    return index;
+  }
+
+  return -1;
+}
+
+/**
+ * Returns true when a block is the managed Jira Comments container.
+ */
+function isJiraCommentsContainer(block) {
+  if (isArchivedBlock(block)) {
+    return false;
+  }
+
+  const richText =
+    block?.type === 'callout'
+      ? block?.callout?.rich_text || []
+      : block?.type === 'toggle'
+        ? block?.toggle?.rich_text || []
+        : [];
+  if (richText.length === 0) {
+    return false;
+  }
+
+  const title = richTextToPlain(richText).trim().toLowerCase();
+  return title === 'jira comments';
+}
+
+/**
+ * Replaces the managed Jira Comments container on a Notion page.
+ */
+export async function replaceJiraCommentsSection(env, pageId, comments, trackedBlockIds = []) {
+  const children = (await listBlockChildren(env, pageId)).filter((block) => !isArchivedBlock(block));
+  const childById = new Map(children.map((block) => [String(block?.id || '').trim(), block]));
+  const sectionStart = findCommentsSectionStart(children);
+  const containerBlocks = children.filter(isJiraCommentsContainer);
+  let blocksToDelete = [];
+
+  // Prefer a dedicated container when present. This keeps refresh cheap:
+  // one delete for the old container instead of deleting every mirrored block.
+  if (containerBlocks.length > 0) {
+    blocksToDelete = containerBlocks;
+  } else if (sectionStart >= 0) {
+    // Fall back to cleaning the old heading-based tail section once so older
+    // pages migrate into the cheaper single-container layout.
+    blocksToDelete = children.slice(sectionStart);
+  } else {
+    const trackedIds = Array.isArray(trackedBlockIds) ? trackedBlockIds.filter(Boolean) : [];
+    blocksToDelete = trackedIds.map((blockId) => childById.get(String(blockId).trim())).filter(Boolean);
+  }
+
+  for (let index = blocksToDelete.length - 1; index >= 0; index -= 1) {
+    await deleteBlock(env, blocksToDelete[index]);
+  }
+
+  const normalizedComments = Array.isArray(comments) ? comments : [];
+  if (normalizedComments.length === 0) {
+    return {
+      commentCount: 0,
+      blockIds: [],
+    };
+  }
+
+  const containerIds = await appendBlocks(env, pageId, [
+    {
+      type: 'callout',
+      callout: {
+        rich_text: [makeTextNode('Jira Comments')],
+        icon: {
+          type: 'emoji',
+          emoji: '💬',
+        },
+        color: 'default',
+      },
+    },
+  ]);
+  const containerId = containerIds[0] || null;
+  const commentBlocks = [];
+
+  for (const comment of normalizedComments) {
+    commentBlocks.push(...formatCommentBlocks(env, comment));
+  }
+
+  if (containerId && commentBlocks.length > 0) {
+    await appendBlocks(env, containerId, commentBlocks);
+  }
+
+  return {
+    commentCount: normalizedComments.length,
+    blockIds: containerId ? [containerId] : [],
+  };
+}
+
+/**
  * Reads the Issue Key property from a Notion page.
  */
 export function getNotionIssueKey(page) {
