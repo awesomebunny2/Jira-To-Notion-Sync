@@ -1,15 +1,21 @@
 import {
+  acquireNotionIssueSyncLock,
   acquireJiraCommentSyncLock,
+  consumePendingNotionIssueSyncLock,
   consumePendingJiraCommentSyncLock,
   deleteJiraCommentSectionState,
   getIssueSyncState,
   getJiraCommentSectionState,
+  getNotionIssueSyncFingerprint,
   hasDb,
+  releaseNotionIssueSyncLock,
   releaseJiraCommentSyncLock,
   saveIssueSyncState,
+  saveNotionIssueSyncFingerprint,
   saveJiraCommentSectionState,
 } from './db.js';
 import {
+  addJiraComment,
   buildJiraIssueFieldUpdate,
   fetchJiraComments,
   fetchJiraIssue,
@@ -19,6 +25,7 @@ import {
   updateJiraIssueFields,
 } from './jira.js';
 import {
+  clearNotionCommentDraft,
   fetchNotionPage,
   getNotionIssueKey,
   getNotionStatus,
@@ -197,6 +204,46 @@ function sameText(left, right) {
 }
 
 /**
+ * Builds a stable fingerprint of the live Notion values that can write back
+ * into Jira or trigger a queued comment send.
+ */
+function buildNotionIssueFingerprint(issueKey, notionStatus, notionIssue) {
+  const labels = Array.isArray(notionIssue?.labels)
+    ? notionIssue.labels.map((label) => String(label || '').trim()).filter(Boolean).sort()
+    : [];
+
+  return JSON.stringify({
+    issueKey: String(issueKey || '').trim(),
+    status: String(notionStatus || '').trim(),
+    name: String(notionIssue?.name || '').trim(),
+    description: String(notionIssue?.description || '').trim(),
+    priority: String(notionIssue?.priority || '').trim(),
+    labels,
+    originalEstimate: String(notionIssue?.originalEstimate || '').trim(),
+    pullRequests: String(notionIssue?.pullRequests || '').trim(),
+    startDate: notionIssue?.startDate || null,
+    commentQueue: String(notionIssue?.commentQueue || '').trim(),
+    commentSubmitAt: notionIssue?.commentSubmitAt || null,
+  });
+}
+
+/**
+ * Returns the expected Notion writable state after the Worker finishes acting
+ * on the current page. Queued comments are cleared once they have been sent.
+ */
+function getExpectedNotionIssueState(notionIssue, commentCreated) {
+  if (!commentCreated) {
+    return notionIssue;
+  }
+
+  return {
+    ...notionIssue,
+    commentQueue: '',
+    commentSubmitAt: null,
+  };
+}
+
+/**
  * Handles Jira issue-update webhooks and syncs the current Jira issue state
  * into the matching Notion page.
  */
@@ -267,6 +314,178 @@ async function handleJiraWebhook(env, payload, delivery = {}) {
 }
 
 /**
+ * Applies the current live Notion page state to Jira and returns the resulting
+ * response plus the post-sync fingerprint that should be remembered for dedupe.
+ */
+async function processNotionIssuePage(env, event, issueKey, page) {
+  const notionIssue = getNotionWritableIssueFields(page);
+  const notionStatus = getNotionStatus(page);
+  if (!notionStatus) {
+    return {
+      fingerprint: null,
+      response: {
+        ok: true,
+        processed: false,
+        reason: 'Ignored Notion page with no Status value.',
+        issueKey,
+        pageId: event.pageId,
+      },
+    };
+  }
+
+  const now = new Date().toISOString();
+  const state = await getIssueSyncState(env, issueKey);
+  const currentJiraIssue = toIssueRecord(env, await fetchJiraIssue(env, issueKey));
+  const trimmedCommentQueue = String(notionIssue.commentQueue || '').trim();
+  let commentCreated = false;
+
+  console.log('[notion:status-check]', {
+    eventId: event.eventId,
+    issueKey,
+    pageId: event.pageId,
+    notionStatus,
+    jiraStatus: currentJiraIssue.status,
+  });
+
+  const transition = sameText(notionStatus, currentJiraIssue.status)
+    ? {
+        result: 'already',
+        currentStatus: currentJiraIssue.status,
+        appliedTarget: currentJiraIssue.status,
+      }
+    : await transitionJiraIssue(env, issueKey, notionStatus);
+
+  console.log('[notion:jira-transition]', {
+    eventId: event.eventId,
+    issueKey,
+    pageId: event.pageId,
+    notionStatus,
+    result: transition.result,
+    currentStatus: transition.currentStatus || null,
+    mappedStatus: transition.mappedStatus || null,
+    appliedTarget: transition.appliedTarget || null,
+    availableTargets: transition.availableTargets || null,
+  });
+
+  // A button-updated submit timestamp keeps comment sending out of the normal
+  // field-edit flow while still working on Notion's free plan.
+  if (trimmedCommentQueue && notionIssue.commentSubmitAt) {
+    await addJiraComment(env, issueKey, trimmedCommentQueue);
+    await clearNotionCommentDraft(env, event.pageId);
+    await syncJiraCommentsToNotion(env, issueKey, event.pageId, 'notion_comment_submit');
+    commentCreated = true;
+
+    console.log('[notion:jira-comment]', {
+      eventId: event.eventId,
+      issueKey,
+      pageId: event.pageId,
+      submitAt: notionIssue.commentSubmitAt,
+      result: 'created',
+    });
+  }
+
+  const issueUpdate = buildJiraIssueFieldUpdate(env, notionIssue, currentJiraIssue);
+
+  console.log('[notion:jira-fields]', {
+    eventId: event.eventId,
+    issueKey,
+    pageId: event.pageId,
+    changedFields: issueUpdate.changedFields,
+  });
+
+  const expectedFingerprint = buildNotionIssueFingerprint(
+    issueKey,
+    notionStatus,
+    getExpectedNotionIssueState(notionIssue, commentCreated)
+  );
+
+  if (transition.result === 'already' && issueUpdate.changedFields.length === 0 && !commentCreated) {
+    await saveIssueSyncState(env, {
+      issueKey,
+      projectKey: state?.project_key || currentJiraIssue.projectKey || null,
+      projectName: state?.project_name || currentJiraIssue.projectName || null,
+      notionPageId: event.pageId,
+      lastNotionEventAt: now,
+      lastSyncedStatus: currentJiraIssue.status,
+    });
+
+    return {
+      fingerprint: expectedFingerprint,
+      response: {
+        ok: true,
+        processed: false,
+        issueKey,
+        pageId: event.pageId,
+        notionStatus,
+        jiraTransitionResult: transition.result,
+        changedFields: issueUpdate.changedFields,
+        commentCreated,
+        reason: 'Notion values already match Jira.',
+      },
+    };
+  }
+
+  const statusApplied = transition.result === 'applied';
+  const fieldApplied = issueUpdate.changedFields.length > 0
+    ? await updateJiraIssueFields(env, issueKey, issueUpdate.fields)
+    : false;
+
+  if (!statusApplied && !fieldApplied && transition.result !== 'already' && !commentCreated) {
+    await saveIssueSyncState(env, {
+      issueKey,
+      projectKey: state?.project_key || currentJiraIssue.projectKey || null,
+      projectName: state?.project_name || currentJiraIssue.projectName || null,
+      notionPageId: event.pageId,
+      lastNotionEventAt: now,
+      lastSyncedStatus: currentJiraIssue.status,
+    });
+
+    return {
+      fingerprint: expectedFingerprint,
+      response: {
+        ok: true,
+        processed: false,
+        issueKey,
+        pageId: event.pageId,
+        notionStatus,
+        jiraTransitionResult: transition.result,
+        changedFields: issueUpdate.changedFields,
+        availableTargets: transition.availableTargets || undefined,
+        reason: issueUpdate.changedFields.length === 0 ? 'Notion values already match Jira.' : undefined,
+      },
+    };
+  }
+
+  const refreshedIssue = toIssueRecord(env, await fetchJiraIssue(env, issueKey));
+  const notionPageId = await upsertIssuePage(env, refreshedIssue, state?.notion_page_id || event.pageId);
+
+  await saveIssueSyncState(env, {
+    issueKey,
+    projectKey: refreshedIssue.projectKey,
+    projectName: refreshedIssue.projectName,
+    notionPageId,
+    lastNotionEventAt: now,
+    lastSyncedStatus: refreshedIssue.status,
+  });
+
+  return {
+    fingerprint: expectedFingerprint,
+    response: {
+      ok: true,
+      processed: commentCreated || statusApplied || fieldApplied,
+      issueKey,
+      pageId: notionPageId,
+      notionStatus,
+      jiraTransitionResult: transition.result,
+      jiraCurrentStatus: refreshedIssue.status,
+      jiraTargetStatus: transition.appliedTarget || transition.mappedStatus || refreshedIssue.status,
+      changedFields: issueUpdate.changedFields,
+      commentCreated,
+    },
+  };
+}
+
+/**
  * Handles Notion page-update webhooks and applies a matching Jira status
  * transition when the Notion Status value has diverged from the last synced
  * Jira status.
@@ -325,132 +544,89 @@ async function handleNotionWebhook(env, payload) {
     };
   }
 
-  const notionIssue = getNotionWritableIssueFields(page);
-  const notionStatus = getNotionStatus(page);
-  if (!notionStatus) {
+  const lock = await acquireNotionIssueSyncLock(env, issueKey);
+  if (!lock.acquired) {
+    console.log('[notion:sync-skipped]', {
+      eventId: event.eventId,
+      issueKey,
+      pageId: event.pageId,
+      reason: 'lock_busy',
+    });
+
     return {
       ok: true,
       processed: false,
-      reason: 'Ignored Notion page with no Status value.',
+      reason: 'Ignored Notion event while another sync for this issue is already running.',
       issueKey,
       pageId: event.pageId,
     };
   }
 
-  const now = new Date().toISOString();
-  const state = await getIssueSyncState(env, issueKey);
-  const currentJiraIssue = toIssueRecord(env, await fetchJiraIssue(env, issueKey));
+  let response = null;
+  try {
+    let shouldRunAgain = false;
 
-  console.log('[notion:status-check]', {
-    eventId: event.eventId,
-    issueKey,
-    pageId: event.pageId,
-    notionStatus,
-    jiraStatus: currentJiraIssue.status,
-  });
+    do {
+      const livePage = await fetchNotionPage(env, event.pageId);
+      const liveIssueKey = getNotionIssueKey(livePage) || issueKey;
+      const liveNotionStatus = getNotionStatus(livePage);
 
-  const transition = sameText(notionStatus, currentJiraIssue.status)
-    ? {
-        result: 'already',
-        currentStatus: currentJiraIssue.status,
-        appliedTarget: currentJiraIssue.status,
+      if (!liveNotionStatus) {
+        response = {
+          ok: true,
+          processed: false,
+          reason: 'Ignored Notion page with no Status value.',
+          issueKey: liveIssueKey,
+          pageId: event.pageId,
+        };
+      } else {
+        const liveNotionIssue = getNotionWritableIssueFields(livePage);
+        const fingerprint = buildNotionIssueFingerprint(liveIssueKey, liveNotionStatus, liveNotionIssue);
+        const lastFingerprintState = await getNotionIssueSyncFingerprint(env, liveIssueKey);
+
+        if (lastFingerprintState?.fingerprint === fingerprint) {
+          console.log('[notion:dedupe-skip]', {
+            eventId: event.eventId,
+            issueKey: liveIssueKey,
+            pageId: event.pageId,
+          });
+
+          response = {
+            ok: true,
+            processed: false,
+            issueKey: liveIssueKey,
+            pageId: event.pageId,
+            notionStatus: liveNotionStatus,
+            reason: 'Live Notion page state already processed.',
+          };
+        } else {
+          const processed = await processNotionIssuePage(env, event, liveIssueKey, livePage);
+          response = processed.response;
+
+          if (processed.fingerprint) {
+            await saveNotionIssueSyncFingerprint(env, {
+              issueKey: liveIssueKey,
+              pageId: response.pageId || event.pageId,
+              fingerprint: processed.fingerprint,
+            });
+          }
+        }
       }
-    : await transitionJiraIssue(env, issueKey, notionStatus);
 
-  console.log('[notion:jira-transition]', {
-    eventId: event.eventId,
-    issueKey,
-    pageId: event.pageId,
-    notionStatus,
-    result: transition.result,
-    currentStatus: transition.currentStatus || null,
-    mappedStatus: transition.mappedStatus || null,
-    appliedTarget: transition.appliedTarget || null,
-    availableTargets: transition.availableTargets || null,
-  });
-
-  const issueUpdate = buildJiraIssueFieldUpdate(env, notionIssue, currentJiraIssue);
-
-  console.log('[notion:jira-fields]', {
-    eventId: event.eventId,
-    issueKey,
-    pageId: event.pageId,
-    changedFields: issueUpdate.changedFields,
-  });
-
-  if (transition.result === 'already' && issueUpdate.changedFields.length === 0) {
-    await saveIssueSyncState(env, {
-      issueKey,
-      projectKey: state?.project_key || currentJiraIssue.projectKey || null,
-      projectName: state?.project_name || currentJiraIssue.projectName || null,
-      notionPageId: event.pageId,
-      lastNotionEventAt: now,
-      lastSyncedStatus: currentJiraIssue.status,
-    });
-
-    return {
-      ok: true,
-      processed: false,
-      issueKey,
-      pageId: event.pageId,
-      notionStatus,
-      jiraTransitionResult: transition.result,
-      changedFields: issueUpdate.changedFields,
-      reason: 'Notion values already match Jira.',
-    };
+      shouldRunAgain = await consumePendingNotionIssueSyncLock(env, issueKey, lock.token);
+      if (shouldRunAgain) {
+        console.log('[notion:sync-rerun]', {
+          eventId: event.eventId,
+          issueKey,
+          pageId: event.pageId,
+        });
+      }
+    } while (shouldRunAgain);
+  } finally {
+    await releaseNotionIssueSyncLock(env, issueKey, lock.token);
   }
 
-  const statusApplied = transition.result === 'applied';
-  const fieldApplied = issueUpdate.changedFields.length > 0
-    ? await updateJiraIssueFields(env, issueKey, issueUpdate.fields)
-    : false;
-
-  if (!statusApplied && !fieldApplied && transition.result !== 'already') {
-    await saveIssueSyncState(env, {
-      issueKey,
-      projectKey: state?.project_key || currentJiraIssue.projectKey || null,
-      projectName: state?.project_name || currentJiraIssue.projectName || null,
-      notionPageId: event.pageId,
-      lastNotionEventAt: now,
-      lastSyncedStatus: currentJiraIssue.status,
-    });
-
-    return {
-      ok: true,
-      processed: false,
-      issueKey,
-      pageId: event.pageId,
-      notionStatus,
-      jiraTransitionResult: transition.result,
-      changedFields: issueUpdate.changedFields,
-      availableTargets: transition.availableTargets || undefined,
-      reason: issueUpdate.changedFields.length === 0 ? 'Notion values already match Jira.' : undefined,
-    };
-  }
-
-  const refreshedIssue = toIssueRecord(env, await fetchJiraIssue(env, issueKey));
-  const notionPageId = await upsertIssuePage(env, refreshedIssue, state?.notion_page_id || event.pageId);
-
-  await saveIssueSyncState(env, {
-    issueKey,
-    projectKey: refreshedIssue.projectKey,
-    projectName: refreshedIssue.projectName,
-    notionPageId,
-    lastNotionEventAt: now,
-    lastSyncedStatus: refreshedIssue.status,
-  });
-
-  return {
-    ok: true,
-    processed: statusApplied || fieldApplied,
-    issueKey,
-    pageId: notionPageId,
-    notionStatus,
-    jiraTransitionResult: transition.result,
-    jiraCurrentStatus: refreshedIssue.status,
-    jiraTargetStatus: transition.appliedTarget || transition.mappedStatus || refreshedIssue.status,
-    changedFields: issueUpdate.changedFields,
-  };
+  return response;
 }
 
 export default {
@@ -495,7 +671,6 @@ export default {
 
         return json(await handleNotionWebhook(env, payload));
       }
-
       return json({ ok: false, error: 'not_found' }, { status: 404 });
     } catch (error) {
       console.error('worker_error', {

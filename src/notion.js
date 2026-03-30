@@ -131,15 +131,6 @@ function richTextWithLinks(content) {
 }
 
 /**
- * Ensures the Pull Requests field always ends with one blank line in Notion so
- * adding another entry stays visually easy in the UI.
- */
-function formatPullRequestsForNotion(content) {
-  const text = String(content || '').replace(/\r\n/g, '\n').replace(/\n+$/g, '');
-  return text ? `${text}\n\n` : '';
-}
-
-/**
  * Creates a Notion select-property payload.
  */
 function select(name) {
@@ -214,7 +205,7 @@ function buildPropertyValue(type, value) {
     case 'rich_text':
       return richText(value);
     case 'rich_text_with_links':
-      return richTextWithLinks(formatPullRequestsForNotion(value));
+      return richTextWithLinks(value);
     case 'select':
       return select(value);
     case 'date':
@@ -681,7 +672,50 @@ export function getNotionWritableIssueFields(page) {
     originalEstimate: readTextProperty(getPageProperty(page, ['Original estimate', 'Original Estimate'])),
     pullRequests: readTextProperty(getPageProperty(page, ['Pull Requests', 'Pull Request Link'])),
     startDate: readDateProperty(getPageProperty(page, ['Start date', 'Start Date'])),
+    commentQueue: readTextProperty(getPageProperty(page, ['Comment Queue', 'Queued Comment', 'Jira Comment Queue'])),
+    commentSubmitAt: readDateProperty(getPageProperty(page, ['Comment Submit At', 'Comment Submitted At'])),
   };
+}
+
+/**
+ * Clears the Notion-side queued comment fields after the Jira comment is sent.
+ * If a sent-timestamp property exists, it is updated at the same time so the
+ * page can show a visible "sent" signal without another formula round-trip.
+ */
+export async function clearNotionCommentDraft(env, pageId) {
+  if (!pageId) {
+    return false;
+  }
+
+  const page = await fetchNotionPage(env, pageId);
+  const properties = page?.properties || {};
+  const updates = {};
+  const queueProperty = getSchemaKeyByName(properties, ['Comment Queue', 'Queued Comment', 'Jira Comment Queue']);
+  const submitProperty = getSchemaKeyByName(properties, ['Comment Submit At', 'Comment Submitted At']);
+  const sentProperty = getSchemaKeyByName(properties, ['Last Comment Sent At', 'Comment Sent At']);
+
+  if (queueProperty) {
+    updates[queueProperty] = richText('');
+  }
+
+  if (submitProperty) {
+    updates[submitProperty] = date(null);
+  }
+
+  if (sentProperty) {
+    updates[sentProperty] = date(new Date().toISOString());
+  }
+
+  if (Object.keys(updates).length === 0) {
+    return false;
+  }
+
+  await notionRequest(env, `/pages/${pageId}`, {
+    method: 'PATCH',
+    body: JSON.stringify({ properties: updates }),
+  });
+
+  return true;
 }
 
 /**

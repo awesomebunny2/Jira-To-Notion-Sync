@@ -507,6 +507,26 @@ function textToAdfDoc(text) {
 }
 
 /**
+ * Creates one Jira issue comment from plain text using the same minimal ADF
+ * shape used by the description and pull-request rich-text fields.
+ */
+export async function addJiraComment(env, issueKey, text) {
+  const body = normalizeMultilineText(text);
+  if (!issueKey || !body) {
+    return false;
+  }
+
+  await jiraRequest(env, `/rest/api/3/issue/${encodeURIComponent(issueKey)}/comment`, {
+    method: 'POST',
+    body: JSON.stringify({
+      body: textToAdfDoc(body),
+    }),
+  });
+
+  return true;
+}
+
+/**
  * Normalizes Jira timestamps into ISO strings that Notion date properties accept.
  */
 function normalizeIso(value) {

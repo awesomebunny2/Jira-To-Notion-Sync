@@ -85,6 +85,77 @@ export async function saveIssueSyncState(
 }
 
 /**
+ * Loads the last successfully processed live Notion-page fingerprint.
+ *
+ * This lets delayed duplicate Notion webhooks skip work when the page state is
+ * identical to the last state already compared against Jira.
+ */
+export async function getNotionIssueSyncFingerprint(env, issueKey) {
+  if (!env.DB || !issueKey) {
+    return null;
+  }
+
+  try {
+    return await env.DB.prepare(
+      `
+        SELECT
+          issue_key,
+          page_id,
+          fingerprint,
+          updated_at
+        FROM notion_issue_sync_fingerprints
+        WHERE issue_key = ?
+        LIMIT 1
+      `
+    )
+      .bind(issueKey)
+      .first();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error || '');
+    if (message.includes('no such table: notion_issue_sync_fingerprints')) {
+      return null;
+    }
+    throw error;
+  }
+}
+
+/**
+ * Saves the last successfully processed live Notion-page fingerprint.
+ */
+export async function saveNotionIssueSyncFingerprint(env, { issueKey, pageId, fingerprint }) {
+  if (!env.DB || !issueKey || !fingerprint) {
+    return false;
+  }
+
+  try {
+    await env.DB.prepare(
+      `
+        INSERT INTO notion_issue_sync_fingerprints (
+          issue_key,
+          page_id,
+          fingerprint,
+          updated_at
+        ) VALUES (?, ?, ?, ?)
+        ON CONFLICT(issue_key) DO UPDATE SET
+          page_id = excluded.page_id,
+          fingerprint = excluded.fingerprint,
+          updated_at = excluded.updated_at
+      `
+    )
+      .bind(issueKey, pageId || null, fingerprint, new Date().toISOString())
+      .run();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error || '');
+    if (message.includes('no such table: notion_issue_sync_fingerprints')) {
+      return false;
+    }
+    throw error;
+  }
+
+  return true;
+}
+
+/**
  * Loads the managed Jira-comments section state for one issue.
  *
  * This lets the Worker replace only the comment blocks it created, instead of
@@ -328,6 +399,133 @@ export async function releaseJiraCommentSyncLock(env, issueKey, token) {
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error || '');
     if (message.includes('no such table: jira_comment_sync_locks')) {
+      return false;
+    }
+    throw error;
+  }
+
+  return true;
+}
+
+/**
+ * Tries to acquire the per-issue Notion sync lock so only one live-page sync
+ * compares and writes Jira state at a time.
+ */
+export async function acquireNotionIssueSyncLock(env, issueKey, leaseMs = 120000) {
+  if (!env.DB || !issueKey) {
+    return { acquired: true, token: null };
+  }
+
+  const now = new Date();
+  const nowIso = now.toISOString();
+  const lockedUntil = new Date(now.getTime() + Math.max(1000, Number(leaseMs) || 120000)).toISOString();
+  const token = crypto.randomUUID();
+
+  try {
+    const result = await env.DB.prepare(
+      `
+        INSERT INTO notion_issue_sync_locks (
+          issue_key,
+          lock_token,
+          locked_until,
+          pending,
+          updated_at
+        ) VALUES (?, ?, ?, 0, ?)
+        ON CONFLICT(issue_key) DO UPDATE SET
+          lock_token = excluded.lock_token,
+          locked_until = excluded.locked_until,
+          updated_at = excluded.updated_at
+        WHERE notion_issue_sync_locks.locked_until IS NULL
+           OR notion_issue_sync_locks.locked_until < excluded.updated_at
+      `
+    )
+      .bind(issueKey, token, lockedUntil, nowIso)
+      .run();
+
+    if (Number(result?.meta?.changes || 0) > 0) {
+      return { acquired: true, token };
+    }
+
+    await env.DB.prepare(
+      `
+        UPDATE notion_issue_sync_locks
+        SET pending = 1,
+            updated_at = ?
+        WHERE issue_key = ?
+      `
+    )
+      .bind(nowIso, issueKey)
+      .run();
+
+    return { acquired: false, token: null };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error || '');
+    if (message.includes('no such table: notion_issue_sync_locks')) {
+      return { acquired: true, token: null };
+    }
+    throw error;
+  }
+}
+
+/**
+ * Checks whether another Notion page event arrived while the current sync held
+ * the lock. When so, the caller should rerun one pass against the latest page.
+ */
+export async function consumePendingNotionIssueSyncLock(env, issueKey, token, leaseMs = 120000) {
+  if (!env.DB || !issueKey || !token) {
+    return false;
+  }
+
+  const now = new Date();
+  const nowIso = now.toISOString();
+  const lockedUntil = new Date(now.getTime() + Math.max(1000, Number(leaseMs) || 120000)).toISOString();
+
+  try {
+    const result = await env.DB.prepare(
+      `
+        UPDATE notion_issue_sync_locks
+        SET pending = 0,
+            locked_until = ?,
+            updated_at = ?
+        WHERE issue_key = ?
+          AND lock_token = ?
+          AND pending = 1
+      `
+    )
+      .bind(lockedUntil, nowIso, issueKey, token)
+      .run();
+
+    return Number(result?.meta?.changes || 0) > 0;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error || '');
+    if (message.includes('no such table: notion_issue_sync_locks')) {
+      return false;
+    }
+    throw error;
+  }
+}
+
+/**
+ * Releases the per-issue Notion sync lock.
+ */
+export async function releaseNotionIssueSyncLock(env, issueKey, token) {
+  if (!env.DB || !issueKey || !token) {
+    return false;
+  }
+
+  try {
+    await env.DB.prepare(
+      `
+        DELETE FROM notion_issue_sync_locks
+        WHERE issue_key = ?
+          AND lock_token = ?
+      `
+    )
+      .bind(issueKey, token)
+      .run();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error || '');
+    if (message.includes('no such table: notion_issue_sync_locks')) {
       return false;
     }
     throw error;
