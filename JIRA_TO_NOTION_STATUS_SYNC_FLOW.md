@@ -49,7 +49,7 @@ This document describes the current lean issue-sync code paths in the rebuilt Wo
 10. Otherwise, the Worker fetches the live Jira issue and compares the current Jira values against the current Notion values.
 11. If the Notion status differs, the Worker applies a matching Jira transition when available.
 12. If any writable Jira fields differ, the Worker updates those Jira issue fields directly.
-13. After Jira field or status changes are applied, the Worker refetches the Jira issue and updates the Notion page so Jira-owned fields like `Updated` stay correct.
+13. After Jira field or status changes are applied, the Worker refetches the Jira issue and updates the Notion page so Jira-owned fields like the read-only `updated` display stay correct.
 14. The Worker saves the page id, latest Notion event time, synced status, and processed fingerprint back into D1.
 15. The Worker returns a JSON response describing what it processed.
 
@@ -63,6 +63,16 @@ This document describes the current lean issue-sync code paths in the rebuilt Wo
 6. The Worker clears `Comment Queue` and `Comment Submit At` in Notion, and stamps `Last Comment Sent At` when that property exists.
 7. The Worker refetches the Jira issue, upserts the Notion page, and refreshes the mirrored `Jira Comments` callout.
 
+## Notion work-log flow
+
+1. A Notion button copies visible `Work Log Time` and `Work Log Description` values into hidden queue properties, but only when the work-log queue is currently empty.
+2. The button also stamps `Work Log Submit At` and clears the visible work-log input fields.
+3. That property change produces the usual Notion `page.properties_updated` webhook.
+4. The Worker fetches the page and reads `Issue Key`, `Work Log Queue Time`, `Work Log Queue Description`, and `Work Log Submit At`.
+5. If `Work Log Queue Time` has text and `Work Log Submit At` is set, the Worker creates a Jira worklog entry.
+6. The Worker clears the queued work-log fields in Notion, and stamps `Last Work Logged At` when that property exists.
+7. The Worker refetches the Jira issue, upserts the Notion page, and refreshes Jira-owned fields like `Time Spent` and `Time Remaining`.
+
 ## Notion properties currently written
 - `Name`
 - `Issue Key`
@@ -70,7 +80,6 @@ This document describes the current lean issue-sync code paths in the rebuilt Wo
 - `Status`
 - `Priority`
 - `Assignee`
-- `Updated`
 - `Description`
 - `Reporter`
 - `Labels`
@@ -129,8 +138,9 @@ This document describes the current lean issue-sync code paths in the rebuilt Wo
 - `Pull Requests` and `Start date` can sync in both directions.
 - Comment creation from Notion is opt-in and handled through `Comment Draft`, `Comment Queue`, and a button-managed `Comment Submit At` property.
 - The recommended Notion UX uses a visible `Comment Status` formula plus an optional `Last Comment Sent At` property for feedback while a queued comment is pending or has just been sent.
-- `Updated` remains Jira-owned.
-- `Time Spent` and `Time Remaining` remain Jira-owned until a separate worklog write path is added.
+- Jira worklog creation from Notion is opt-in and handled through visible work-log inputs, queued hidden work-log properties, and a button-managed `Work Log Submit At` property.
+- `updated` remains Jira-owned and is exposed through `Jira Read Only Props` rather than a raw editable property.
+- `Time Spent` and `Time Remaining` remain Jira-owned fields; Notion now adds new Jira worklog entries instead of editing those totals directly.
 - Native Notion comment sync stays out of scope.
 - Notion `page.content_updated` events are ignored because mirrored Jira comments live in page content and should not trigger Jira writes.
 - Notion -> Jira dedupe and serialization rely on the `notion_issue_sync_locks` and `notion_issue_sync_fingerprints` migrations when available.

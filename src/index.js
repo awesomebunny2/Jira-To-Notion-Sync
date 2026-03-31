@@ -16,6 +16,7 @@ import {
 } from './db.js';
 import {
   addJiraComment,
+  addJiraWorklog,
   buildJiraIssueFieldUpdate,
   fetchJiraComments,
   fetchJiraIssue,
@@ -26,6 +27,7 @@ import {
 } from './jira.js';
 import {
   clearNotionCommentDraft,
+  clearNotionWorkLogDraft,
   fetchNotionPage,
   getNotionIssueKey,
   getNotionStatus,
@@ -224,6 +226,9 @@ function buildNotionIssueFingerprint(issueKey, notionStatus, notionIssue) {
     startDate: notionIssue?.startDate || null,
     commentQueue: String(notionIssue?.commentQueue || '').trim(),
     commentSubmitAt: notionIssue?.commentSubmitAt || null,
+    workLogQueueTime: String(notionIssue?.workLogQueueTime || '').trim(),
+    workLogQueueDescription: String(notionIssue?.workLogQueueDescription || '').trim(),
+    workLogSubmitAt: notionIssue?.workLogSubmitAt || null,
   });
 }
 
@@ -231,15 +236,14 @@ function buildNotionIssueFingerprint(issueKey, notionStatus, notionIssue) {
  * Returns the expected Notion writable state after the Worker finishes acting
  * on the current page. Queued comments are cleared once they have been sent.
  */
-function getExpectedNotionIssueState(notionIssue, commentCreated) {
-  if (!commentCreated) {
-    return notionIssue;
-  }
-
+function getExpectedNotionIssueState(notionIssue, { commentCreated = false, workLogCreated = false } = {}) {
   return {
     ...notionIssue,
-    commentQueue: '',
-    commentSubmitAt: null,
+    commentQueue: commentCreated ? '' : notionIssue.commentQueue,
+    commentSubmitAt: commentCreated ? null : notionIssue.commentSubmitAt,
+    workLogQueueTime: workLogCreated ? '' : notionIssue.workLogQueueTime,
+    workLogQueueDescription: workLogCreated ? '' : notionIssue.workLogQueueDescription,
+    workLogSubmitAt: workLogCreated ? null : notionIssue.workLogSubmitAt,
   };
 }
 
@@ -337,7 +341,10 @@ async function processNotionIssuePage(env, event, issueKey, page) {
   const state = await getIssueSyncState(env, issueKey);
   const currentJiraIssue = toIssueRecord(env, await fetchJiraIssue(env, issueKey));
   const trimmedCommentQueue = String(notionIssue.commentQueue || '').trim();
+  const trimmedWorkLogQueueTime = String(notionIssue.workLogQueueTime || '').trim();
+  const trimmedWorkLogQueueDescription = String(notionIssue.workLogQueueDescription || '').trim();
   let commentCreated = false;
+  let workLogCreated = false;
 
   console.log('[notion:status-check]', {
     eventId: event.eventId,
@@ -384,6 +391,24 @@ async function processNotionIssuePage(env, event, issueKey, page) {
     });
   }
 
+  // Worklog submissions use the same queued button pattern as comments so the
+  // visible draft can clear immediately while Jira updates later from the queue.
+  if (trimmedWorkLogQueueTime && notionIssue.workLogSubmitAt) {
+    await addJiraWorklog(env, issueKey, trimmedWorkLogQueueTime, trimmedWorkLogQueueDescription);
+    await clearNotionWorkLogDraft(env, event.pageId);
+    workLogCreated = true;
+
+    console.log('[notion:jira-worklog]', {
+      eventId: event.eventId,
+      issueKey,
+      pageId: event.pageId,
+      submitAt: notionIssue.workLogSubmitAt,
+      timeSpent: trimmedWorkLogQueueTime,
+      hasDescription: Boolean(trimmedWorkLogQueueDescription),
+      result: 'created',
+    });
+  }
+
   const issueUpdate = buildJiraIssueFieldUpdate(env, notionIssue, currentJiraIssue);
 
   console.log('[notion:jira-fields]', {
@@ -396,10 +421,10 @@ async function processNotionIssuePage(env, event, issueKey, page) {
   const expectedFingerprint = buildNotionIssueFingerprint(
     issueKey,
     notionStatus,
-    getExpectedNotionIssueState(notionIssue, commentCreated)
+    getExpectedNotionIssueState(notionIssue, { commentCreated, workLogCreated })
   );
 
-  if (transition.result === 'already' && issueUpdate.changedFields.length === 0 && !commentCreated) {
+  if (transition.result === 'already' && issueUpdate.changedFields.length === 0 && !commentCreated && !workLogCreated) {
     await saveIssueSyncState(env, {
       issueKey,
       projectKey: state?.project_key || currentJiraIssue.projectKey || null,
@@ -420,6 +445,7 @@ async function processNotionIssuePage(env, event, issueKey, page) {
         jiraTransitionResult: transition.result,
         changedFields: issueUpdate.changedFields,
         commentCreated,
+        workLogCreated,
         reason: 'Notion values already match Jira.',
       },
     };
@@ -430,7 +456,7 @@ async function processNotionIssuePage(env, event, issueKey, page) {
     ? await updateJiraIssueFields(env, issueKey, issueUpdate.fields)
     : false;
 
-  if (!statusApplied && !fieldApplied && transition.result !== 'already' && !commentCreated) {
+  if (!statusApplied && !fieldApplied && transition.result !== 'already' && !commentCreated && !workLogCreated) {
     await saveIssueSyncState(env, {
       issueKey,
       projectKey: state?.project_key || currentJiraIssue.projectKey || null,
@@ -472,7 +498,7 @@ async function processNotionIssuePage(env, event, issueKey, page) {
     fingerprint: expectedFingerprint,
     response: {
       ok: true,
-      processed: commentCreated || statusApplied || fieldApplied,
+      processed: commentCreated || workLogCreated || statusApplied || fieldApplied,
       issueKey,
       pageId: notionPageId,
       notionStatus,
@@ -481,6 +507,7 @@ async function processNotionIssuePage(env, event, issueKey, page) {
       jiraTargetStatus: transition.appliedTarget || transition.mappedStatus || refreshedIssue.status,
       changedFields: issueUpdate.changedFields,
       commentCreated,
+      workLogCreated,
     },
   };
 }

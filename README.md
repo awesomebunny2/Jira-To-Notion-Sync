@@ -7,6 +7,7 @@ Clean baseline Worker rebuild.
 - Jira -> Notion mirrored Jira comments section
 - Notion -> Jira sync for status and a small writable field set
 - Notion -> Jira comment creation through `Comment Draft`, `Comment Queue`, and a Notion button
+- Notion -> Jira worklog creation through queued work-log fields and a Notion button
 - Existing webhooks and Notion database preserved
 
 ## Jira Events Currently Applied To Notion
@@ -25,7 +26,6 @@ Clean baseline Worker rebuild.
 - `Status`
 - `Priority`
 - `Assignee`
-- `Updated`
 - `Description`
 - `Reporter`
 - `Labels`
@@ -84,8 +84,17 @@ Clean baseline Worker rebuild.
   - `Original estimate`
   - `Pull Requests`
   - `Start date`
-- `Updated` stays Jira-owned and is refreshed back into Notion after Jira changes.
+- `updated` still comes from Jira, but it now lives in `Jira Read Only Props` and your formula-backed `Last Updated` field rather than a raw `Updated` property.
 - `Time Spent` and `Time Remaining` are still Jira-owned for now.
+- Notion can create a new Jira worklog on Notion's free plan through the normal `/webhook/notion` endpoint.
+- The intended Notion UX is:
+  - a visible `Work Log Time` text property for entries like `20m`, `1h`, or `1h 30m`
+  - a visible `Work Log Description` text property for the optional work summary
+  - hidden `Work Log Queue Time` and `Work Log Queue Description` properties
+  - a hidden timestamp property like `Work Log Submit At`
+  - an optional date property like `Last Work Logged At` for visual confirmation after Jira accepts the worklog
+  - a button property like `Log Work to Jira` that only fills the worklog queue when it is empty, then sets `Work Log Submit At` and clears the visible inputs
+- When the normal Notion integration webhook arrives, the Worker sees `Work Log Queue Time` plus `Work Log Submit At`, creates a Jira worklog entry, clears the queued work-log fields, and refreshes the Jira-owned time-tracking fields in Notion.
 - Jira comments are mirrored into one managed `Jira Comments` callout block on the page.
 - Notion can create a new Jira comment on Notion's free plan through the normal `/webhook/notion` endpoint.
 - The intended Notion UX is:
@@ -144,6 +153,32 @@ npx wrangler tail
 11. Keep using the normal integration webhook for `/webhook/notion` as before for field sync.
 
 This works on Notion's free personal plan, but comment sends will still follow Notion's normal aggregated webhook timing for page property updates.
+
+## Notion work-log setup
+1. Add a text property named `Work Log Time`.
+2. Add a text property named `Work Log Description`.
+3. Add a text property named `Work Log Queue Time`.
+4. Add a text property named `Work Log Queue Description`.
+5. Add a date property named `Work Log Submit At`.
+6. Optional but recommended: add a date property named `Last Work Logged At`.
+7. Optional but recommended: add a formula property named `Work Log Status`.
+8. Use this formula for `Work Log Status`:
+   - `if(!empty(prop("Work Log Queue Time")), "Pending Jira work log", if(!empty(prop("Work Log Time")), "Ready to log", if(!empty(prop("Last Work Logged At")), "Logged to Jira", "Idle")))`
+9. Add a button property named `Log Work to Jira`.
+10. If your Notion button editor supports variables, define:
+   - `can_log_work` = `empty(prop("Work Log Queue Time")) and !empty(prop("Work Log Time"))`
+   - `queued_time` = `prop("Work Log Time")`
+   - `queued_description` = `prop("Work Log Description")`
+11. Configure the button actions in this order:
+   - set `Work Log Queue Time` to `if(can_log_work, queued_time, prop("Work Log Queue Time"))`
+   - set `Work Log Queue Description` to `if(can_log_work, queued_description, prop("Work Log Queue Description"))`
+   - set `Work Log Submit At` to `if(can_log_work, now(), prop("Work Log Submit At"))`
+   - set `Work Log Time` to `if(can_log_work, "", prop("Work Log Time"))`
+   - set `Work Log Description` to `if(can_log_work, "", prop("Work Log Description"))`
+12. If your button editor does not support variables, use the same logic inline with the property names directly.
+13. Hide `Work Log Queue Time`, `Work Log Queue Description`, and `Work Log Submit At` from your main views.
+
+This logs additive Jira worklog entries. It does not overwrite the aggregate `Time Spent` total directly.
 
 ## Archived code
 Previous experimental implementation was archived under:

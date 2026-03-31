@@ -527,6 +527,34 @@ export async function addJiraComment(env, issueKey, text) {
 }
 
 /**
+ * Creates one Jira worklog entry from a queued Notion work-log submission.
+ *
+ * `timeSpent` is passed through in Jira's native shorthand format like
+ * `20m`, `1h`, or `1h 30m`, while the optional description becomes the
+ * worklog comment body.
+ */
+export async function addJiraWorklog(env, issueKey, timeSpent, description = '') {
+  const normalizedTimeSpent = String(timeSpent || '').trim();
+  const normalizedDescription = normalizeMultilineText(description);
+
+  if (!issueKey || !normalizedTimeSpent) {
+    return false;
+  }
+
+  const body = { timeSpent: normalizedTimeSpent };
+  if (normalizedDescription) {
+    body.comment = textToAdfDoc(normalizedDescription);
+  }
+
+  await jiraRequest(env, `/rest/api/3/issue/${encodeURIComponent(issueKey)}/worklog`, {
+    method: 'POST',
+    body: JSON.stringify(body),
+  });
+
+  return true;
+}
+
+/**
  * Normalizes Jira timestamps into ISO strings that Notion date properties accept.
  */
 function normalizeIso(value) {

@@ -674,6 +674,13 @@ export function getNotionWritableIssueFields(page) {
     startDate: readDateProperty(getPageProperty(page, ['Start date', 'Start Date'])),
     commentQueue: readTextProperty(getPageProperty(page, ['Comment Queue', 'Queued Comment', 'Jira Comment Queue'])),
     commentSubmitAt: readDateProperty(getPageProperty(page, ['Comment Submit At', 'Comment Submitted At'])),
+    workLogQueueTime: readTextProperty(
+      getPageProperty(page, ['Work Log Queue Time', 'Queued Work Log Time', 'Jira Work Log Queue Time'])
+    ),
+    workLogQueueDescription: readTextProperty(
+      getPageProperty(page, ['Work Log Queue Description', 'Queued Work Log Description', 'Jira Work Log Queue Description'])
+    ),
+    workLogSubmitAt: readDateProperty(getPageProperty(page, ['Work Log Submit At', 'Work Logged Submit At'])),
   };
 }
 
@@ -704,6 +711,58 @@ export async function clearNotionCommentDraft(env, pageId) {
 
   if (sentProperty) {
     updates[sentProperty] = date(new Date().toISOString());
+  }
+
+  if (Object.keys(updates).length === 0) {
+    return false;
+  }
+
+  await notionRequest(env, `/pages/${pageId}`, {
+    method: 'PATCH',
+    body: JSON.stringify({ properties: updates }),
+  });
+
+  return true;
+}
+
+/**
+ * Clears the queued Notion work-log fields after the Jira worklog is created.
+ * If a sent-timestamp property exists, it is updated at the same time so the
+ * page can show a visible "logged" signal.
+ */
+export async function clearNotionWorkLogDraft(env, pageId) {
+  if (!pageId) {
+    return false;
+  }
+
+  const page = await fetchNotionPage(env, pageId);
+  const properties = page?.properties || {};
+  const updates = {};
+  const queueTimeProperty = getSchemaKeyByName(
+    properties,
+    ['Work Log Queue Time', 'Queued Work Log Time', 'Jira Work Log Queue Time']
+  );
+  const queueDescriptionProperty = getSchemaKeyByName(
+    properties,
+    ['Work Log Queue Description', 'Queued Work Log Description', 'Jira Work Log Queue Description']
+  );
+  const submitProperty = getSchemaKeyByName(properties, ['Work Log Submit At', 'Work Logged Submit At']);
+  const loggedProperty = getSchemaKeyByName(properties, ['Last Work Logged At', 'Work Logged At']);
+
+  if (queueTimeProperty) {
+    updates[queueTimeProperty] = richText('');
+  }
+
+  if (queueDescriptionProperty) {
+    updates[queueDescriptionProperty] = richText('');
+  }
+
+  if (submitProperty) {
+    updates[submitProperty] = date(null);
+  }
+
+  if (loggedProperty) {
+    updates[loggedProperty] = date(new Date().toISOString());
   }
 
   if (Object.keys(updates).length === 0) {
